@@ -53,7 +53,7 @@ agy plugin install .
 
 | Type | Name | Purpose |
 | :--- | :--- | :--- |
-| **Skill** | `/ov-doctor` | Run `./bin/ov-agy doctor` to inspect config, Root-Key 403 guard, `/health`, `/mcp`, `peer` ID, and WAL |
+| **Skill** | `/ov-doctor` | Run `./scripts/ov-agy doctor` to inspect config, Root-Key 403 guard, `/health`, `/mcp`, `peer` ID, and WAL |
 | **Skill** | `/ov-ingest` | SOP for importing docs, websites, and Git repos into `viking://` resources/skills |
 | **Skill** | `/ov-experience` | Telemetry-preserving troubleshooting workflow (`search_experience` + `read_experience`) |
 | **Skill** | `/ov-rule-search` | Query compiled team architectural constraints via `rule_search` before modifying modules |
@@ -70,6 +70,6 @@ agy plugin install .
   cargo fmt --check
   cargo clippy --all-targets -- -D warnings
   cargo test
-  ./bin/ov-agy doctor --json
+  ./scripts/ov-agy doctor --json
   agy plugin validate --strict .
   ```

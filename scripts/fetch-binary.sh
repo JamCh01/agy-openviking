@@ -13,6 +13,9 @@ BASE_URL="${OPENVIKING_AGY_RELEASE_BASE_URL:-https://github.com/${REPO}/releases
 OS=$(uname -s)
 ARCH=$(uname -m)
 
+BIN_NAME="ov-agy"
+ARCHIVE_EXT="tar.gz"
+
 case "$OS" in
     Darwin)
         case "$ARCH" in
@@ -28,13 +31,23 @@ case "$OS" in
             *) echo "[ov-agy] Unsupported Linux architecture: $ARCH" >&2; exit 1 ;;
         esac
         ;;
+    MINGW*|MSYS*|CYGWIN*)
+        case "$ARCH" in
+            x86_64|amd64)
+                TARGET="x86_64-pc-windows-msvc"
+                BIN_NAME="ov-agy.exe"
+                ARCHIVE_EXT="zip"
+                ;;
+            *) echo "[ov-agy] Unsupported Windows architecture: $ARCH" >&2; exit 1 ;;
+        esac
+        ;;
     *)
         echo "[ov-agy] Unsupported operating system: $OS" >&2
         exit 1
         ;;
 esac
 
-ARCHIVE="ov-agy-v${VERSION}-${TARGET}.tar.gz"
+ARCHIVE="ov-agy-v${VERSION}-${TARGET}.${ARCHIVE_EXT}"
 TMP_DIR=$(mktemp -d "${TMPDIR:-/tmp}/ov-agy-fetch.XXXXXX")
 cleanup() {
     rm -rf "$TMP_DIR"
@@ -65,12 +78,27 @@ if [ "$EXPECTED_SHA" != "$ACTUAL_SHA" ]; then
     exit 1
 fi
 
-tar -xzf "$TMP_DIR/$ARCHIVE" -C "$TMP_DIR" >&2
+if [ "$ARCHIVE_EXT" = "zip" ]; then
+    if command -v unzip >/dev/null 2>&1; then
+        unzip -q "$TMP_DIR/$ARCHIVE" -d "$TMP_DIR" >&2
+    else
+        tar -xf "$TMP_DIR/$ARCHIVE" -C "$TMP_DIR" >&2
+    fi
+else
+    tar -xzf "$TMP_DIR/$ARCHIVE" -C "$TMP_DIR" >&2
+fi
 
 DEST_DIR=$(dirname "$DEST_BIN")
 mkdir -p "$DEST_DIR"
 TMP_BIN="${DEST_BIN}.tmp.$$"
-cp "$TMP_DIR/ov-agy" "$TMP_BIN"
+if [ -f "$TMP_DIR/$BIN_NAME" ]; then
+    cp "$TMP_DIR/$BIN_NAME" "$TMP_BIN"
+elif [ -f "$TMP_DIR/dist/$BIN_NAME" ]; then
+    cp "$TMP_DIR/dist/$BIN_NAME" "$TMP_BIN"
+else
+    echo "[ov-agy] Extracted archive missing ${BIN_NAME}" >&2
+    exit 1
+fi
 chmod +x "$TMP_BIN"
 mv "$TMP_BIN" "$DEST_BIN"
 

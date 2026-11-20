@@ -13,16 +13,16 @@ Run the bundled native diagnostic command to inspect the OpenViking plugin end-t
 
 ## Step 1: Run Diagnostics
 
-Execute `./bin/ov-agy doctor` from the plugin root (or `${PLUGIN_ROOT}/bin/ov-agy doctor` if running from the workspace):
+Execute `./scripts/ov-agy doctor` from the plugin root (or `${PLUGIN_ROOT}/scripts/ov-agy doctor` if running from the workspace):
 
 ```bash
-"${PLUGIN_ROOT:-.}/bin/ov-agy" doctor
+"${PLUGIN_ROOT:-.}/scripts/ov-agy" doctor
 ```
 
 For machine-readable JSON output:
 
 ```bash
-"${PLUGIN_ROOT:-.}/bin/ov-agy" doctor --json
+"${PLUGIN_ROOT:-.}/scripts/ov-agy" doctor --json
 ```
 
 The diagnostic report verifies:

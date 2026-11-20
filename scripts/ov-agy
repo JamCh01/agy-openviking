@@ -1,0 +1,31 @@
+#!/bin/sh
+set -eu
+
+VERSION="0.1.0"
+
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+PLUGIN_ROOT_RESOLVED=${PLUGIN_ROOT:-$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)}
+
+for candidate in \
+    "$PLUGIN_ROOT_RESOLVED/target/release/ov-agy" \
+    "$PLUGIN_ROOT_RESOLVED/target/release/ov-agy.exe" \
+    "$PLUGIN_ROOT_RESOLVED/target/debug/ov-agy" \
+    "$PLUGIN_ROOT_RESOLVED/target/debug/ov-agy.exe"
+do
+    if [ -x "$candidate" ]; then
+        exec "$candidate" "$@"
+    fi
+done
+
+DATA_DIR=${OPENVIKING_PLUGIN_DATA:-${PLUGIN_DATA:-"$HOME/.openviking/agy-plugin"}}
+case "$(uname -s 2>/dev/null || echo unknown)" in
+    MINGW*|MSYS*|CYGWIN*) BIN_EXT=".exe" ;;
+    *)                    BIN_EXT="" ;;
+esac
+CACHED_BIN="$DATA_DIR/bin/ov-agy-v${VERSION}${BIN_EXT}"
+
+if [ ! -x "$CACHED_BIN" ]; then
+    "$PLUGIN_ROOT_RESOLVED/scripts/fetch-binary.sh" "$VERSION" "$CACHED_BIN" >&2
+fi
+
+exec "$CACHED_BIN" "$@"

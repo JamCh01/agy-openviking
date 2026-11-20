@@ -22,6 +22,6 @@ Zero-Node-dependency Rust plugin integrating [OpenViking](https://github.com/vol
 2. Install and verify:
    ```bash
    agy plugin install .
-   ./bin/ov-agy doctor
+   ./scripts/ov-agy doctor
    ```
 3. Run `/ov-doctor` inside `agy` at any time to inspect connectivity, credentials, Git `peer` ID, and offline WAL status.

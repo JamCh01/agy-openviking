@@ -3,15 +3,16 @@
   "name": "openviking",
   "displayName": "OpenViking Context & Memory",
   "version": "0.1.0",
-  "description": "Long-term memory, hierarchical L0/L1/L2 knowledge retrieval, architectural rules, and remote skills powered by OpenViking.",
+  "logo": "assets/logo.svg",
+  "description": "Long-term memory, hierarchical L0/L1/L2 context retrieval, architectural rules, and remote skills for Antigravity CLI via OpenViking.",
   "suggestedPrompts": [
     "Run /ov-doctor to verify my OpenViking server connection and plugin status",
     "Use /ov-rule-search to check applicable architectural rules before modifying this module",
     "Explore viking://resources and summarize our project architecture docs"
   ],
   "author": {
-    "name": "OpenViking Contributors",
-    "url": "https://github.com/JamCh01/agy-openviking"
+    "name": "JamCh01",
+    "url": "https://github.com/JamCh01"
   },
   "homepage": "https://github.com/JamCh01/agy-openviking",
   "repository": "https://github.com/JamCh01/agy-openviking",

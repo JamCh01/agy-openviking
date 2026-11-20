@@ -3,7 +3,7 @@
     "openviking": {
       "command": "/bin/sh",
       "args": [
-        "${PLUGIN_ROOT}/bin/ov-agy",
+        "${PLUGIN_ROOT}/scripts/ov-agy",
         "mcp-proxy"
       ],
       "cwd": "${PLUGIN_ROOT}",
