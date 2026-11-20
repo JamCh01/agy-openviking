@@ -1397,3 +1397,123 @@ async fn test_6_root_key_guard_and_fail_open_when_server_down() {
         "unreachable server must emit safe no-op JSON `{{}}`"
     );
 }
+
+#[test]
+fn test_7_marketplace_layout_and_launcher_contract() {
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+
+    assert!(
+        !manifest_dir.join("bin").exists(),
+        "legacy bin/ directory must be removed"
+    );
+
+    let launcher_script = manifest_dir.join("scripts").join("ov-agy");
+    assert!(
+        launcher_script.is_file(),
+        "scripts/ov-agy launcher must exist"
+    );
+
+    let fetch_script = manifest_dir.join("scripts").join("fetch-binary.sh");
+    assert!(
+        fetch_script.is_file(),
+        "scripts/fetch-binary.sh helper must exist"
+    );
+
+    let launcher_content =
+        fs::read_to_string(&launcher_script).expect("scripts/ov-agy should be readable");
+    assert!(
+        launcher_content.contains("$PLUGIN_ROOT_RESOLVED/scripts/fetch-binary.sh"),
+        "scripts/ov-agy must invoke scripts/fetch-binary.sh via PLUGIN_ROOT_RESOLVED"
+    );
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = fs::metadata(&launcher_script)
+            .expect("scripts/ov-agy metadata should be readable")
+            .permissions()
+            .mode();
+        assert_ne!(mode & 0o111, 0, "scripts/ov-agy must be executable (0755)");
+
+        let version_out = Command::new(&launcher_script)
+            .arg("--version")
+            .current_dir(&manifest_dir)
+            .output()
+            .expect("scripts/ov-agy --version should execute");
+        assert!(
+            version_out.status.success(),
+            "scripts/ov-agy --version must exit 0"
+        );
+    }
+
+    let legacy_launcher = concat!("bin/", "ov-agy");
+    let hooks_raw =
+        fs::read_to_string(manifest_dir.join("hooks.json")).expect("hooks.json must be readable");
+    assert!(
+        hooks_raw.contains("./scripts/ov-agy hook "),
+        "hooks.json must invoke ./scripts/ov-agy via relative path"
+    );
+    assert!(
+        !hooks_raw.contains(legacy_launcher) && !hooks_raw.contains("${"),
+        "hooks.json must not reference legacy bin launcher or unexpanded shell variables"
+    );
+
+    let mcp_raw = fs::read_to_string(manifest_dir.join("mcp_config.json"))
+        .expect("mcp_config.json must be readable");
+    assert!(
+        mcp_raw.contains("${PLUGIN_ROOT}/scripts/ov-agy"),
+        "mcp_config.json must reference ${{PLUGIN_ROOT}}/scripts/ov-agy"
+    );
+    assert!(
+        !mcp_raw.contains(legacy_launcher),
+        "mcp_config.json must not reference legacy bin launcher"
+    );
+
+    let plugin_raw =
+        fs::read_to_string(manifest_dir.join(".antigravity-plugin").join("plugin.json"))
+            .expect("plugin.json must be readable");
+    let plugin_val: Value =
+        serde_json::from_str(&plugin_raw).expect("plugin.json must parse as valid JSON");
+
+    assert_eq!(
+        plugin_val.get("logo").and_then(Value::as_str),
+        Some("assets/logo.svg"),
+        "plugin.json must point logo to assets/logo.svg"
+    );
+    let logo_svg = fs::read_to_string(manifest_dir.join("assets").join("logo.svg"))
+        .expect("assets/logo.svg must exist and be readable");
+    assert!(
+        logo_svg.contains("width=\"128\"")
+            && logo_svg.contains("height=\"128\"")
+            && logo_svg.contains("viewBox=\"0 0 128 128\""),
+        "assets/logo.svg must be a 128x128 1:1 square SVG"
+    );
+
+    let desc_len = plugin_val
+        .get("description")
+        .and_then(Value::as_str)
+        .expect("plugin.json must contain description")
+        .chars()
+        .count();
+    assert!(
+        (120..=160).contains(&desc_len),
+        "plugin.json description length ({desc_len}) must be between 120 and 160 characters"
+    );
+
+    let author_present = plugin_val
+        .get("author")
+        .and_then(|author| {
+            author
+                .as_str()
+                .or_else(|| author.get("name").and_then(Value::as_str))
+        })
+        .is_some_and(|name| !name.trim().is_empty());
+    assert!(author_present, "plugin.json must include non-empty author");
+
+    let rule_raw = fs::read_to_string(manifest_dir.join("rules").join("openviking-context.md"))
+        .expect("rules/openviking-context.md must be readable");
+    assert!(
+        rule_raw.starts_with("---\ntrigger: always_on\n"),
+        "rules/openviking-context.md frontmatter must declare trigger: always_on"
+    );
+}
