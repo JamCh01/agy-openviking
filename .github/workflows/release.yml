@@ -75,19 +75,39 @@ jobs:
         if: ${{ !matrix.use_zigbuild }}
         run: cargo build --release --target ${{ matrix.target }}
 
-      - name: Package archive
+      - name: Verify tag matches plugin.json version
         shell: bash
         run: |
           set -euo pipefail
-          VERSION="${GITHUB_REF_NAME}"
-          ARCHIVE="ov-agy-${VERSION}-${{ matrix.target }}.${{ matrix.archive_ext }}"
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          MANIFEST_VERSION="$(jq -r '.version' .antigravity-plugin/plugin.json)"
+          if [ "${TAG_VERSION}" != "${MANIFEST_VERSION}" ]; then
+            echo "Release tag v${TAG_VERSION} does not match plugin.json version ${MANIFEST_VERSION}" >&2
+            exit 1
+          fi
+
+      - name: Package flat archive & verify layout
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          ARCHIVE="ov-agy-v${VERSION}-${{ matrix.target }}.${{ matrix.archive_ext }}"
           mkdir -p dist
           cp "target/${{ matrix.target }}/release/${{ matrix.bin_name }}" "dist/${{ matrix.bin_name }}"
           if [ "${{ matrix.archive_ext }}" = "zip" ]; then
             (cd dist && 7z a -tzip "../${ARCHIVE}" "${{ matrix.bin_name }}")
+            VERIFY_DIR="$(mktemp -d)"
+            7z x -y "${ARCHIVE}" "-o${VERIFY_DIR}" >/dev/null
+            test -f "${VERIFY_DIR}/${{ matrix.bin_name }}"
+            rm -rf "${VERIFY_DIR}"
           else
-            chmod +x "dist/${{ matrix.bin_name }}"
+            chmod 0755 "dist/${{ matrix.bin_name }}"
             tar -C dist -czf "${ARCHIVE}" "${{ matrix.bin_name }}"
+            ENTRIES="$(tar -tzf "${ARCHIVE}")"
+            if [ "${ENTRIES}" != "${{ matrix.bin_name }}" ]; then
+              echo "Unexpected tar layout in ${ARCHIVE}: ${ENTRIES}" >&2
+              exit 1
+            fi
           fi
           rm -rf dist
 
@@ -95,7 +115,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: archive-${{ matrix.target }}
-          path: ov-agy-*
+          path: ov-agy-v*
 
   publish:
     name: Publish Release & Checksums
@@ -111,13 +131,13 @@ jobs:
       - name: Generate checksums.txt
         run: |
           cd artifacts
-          sha256sum ov-agy-* | sort -k2 > checksums.txt
+          sha256sum ov-agy-v* | sort -k2 > checksums.txt
           cat checksums.txt
 
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            artifacts/ov-agy-*
+            artifacts/ov-agy-v*
             artifacts/checksums.txt
           generate_release_notes: true
