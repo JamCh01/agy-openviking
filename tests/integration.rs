@@ -1517,3 +1517,277 @@ fn test_7_marketplace_layout_and_launcher_contract() {
         "rules/openviking-context.md frontmatter must declare trigger: always_on"
     );
 }
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_8_cold_start_concurrent_fetch_and_sha256_guard() {
+    use sha2::Digest;
+    use std::os::unix::fs::PermissionsExt;
+
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let temp_dir = TempDir::new().expect("cold-start tempdir must create");
+
+    // 1. Set up a synthetic plugin root WITHOUT target/{release,debug}/ov-agy and with
+    //    a distinct version ("9.8.7") in .antigravity-plugin/plugin.json to verify dynamic parsing.
+    let fake_plugin_root = temp_dir.path().join("plugin-root");
+    let fake_manifest_dir = fake_plugin_root.join(".antigravity-plugin");
+    let fake_scripts_dir = fake_plugin_root.join("scripts");
+    fs::create_dir_all(&fake_manifest_dir).expect("fake manifest dir must create");
+    fs::create_dir_all(&fake_scripts_dir).expect("fake scripts dir must create");
+
+    let fake_manifest_body = serde_json::to_string_pretty(&json!({
+        "name": "openviking",
+        "version": "9.8.7",
+        "description": "Synthetic manifest version for cold-start download verification"
+    }))
+    .expect("fake plugin.json must serialize");
+    fs::write(fake_manifest_dir.join("plugin.json"), fake_manifest_body)
+        .expect("fake plugin.json must write");
+
+    for script_name in ["ov-agy", "fetch-binary.sh"] {
+        let src = manifest_dir.join("scripts").join(script_name);
+        let dst = fake_scripts_dir.join(script_name);
+        fs::copy(&src, &dst).expect("launcher script must copy");
+        let mut perms = fs::metadata(&dst)
+            .expect("copied script metadata must read")
+            .permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&dst, perms).expect("copied script must be chmod 0755");
+    }
+
+    // 2. Determine expected target triple matching scripts/fetch-binary.sh on this host.
+    let expected_target = match (std::env::consts::OS, std::env::consts::ARCH) {
+        ("macos", "aarch64") => "aarch64-apple-darwin",
+        ("macos", "x86_64") => "x86_64-apple-darwin",
+        ("linux", "aarch64") => "aarch64-unknown-linux-musl",
+        ("linux", "x86_64") => "x86_64-unknown-linux-musl",
+        (os, arch) => panic!("unsupported unix test host {os}/{arch}"),
+    };
+    let archive_name = format!("ov-agy-v9.8.7-{expected_target}.tar.gz");
+
+    // 3. Package flat `ov-agy` archive identically to .github/workflows/release.yml.
+    let stage_dist = temp_dir.path().join("dist");
+    fs::create_dir_all(&stage_dist).expect("dist staging dir must create");
+    let staged_bin = stage_dist.join("ov-agy");
+    fs::copy(ov_agy_bin(), &staged_bin).expect("compiled ov-agy binary must copy to dist");
+    let mut bin_perms = fs::metadata(&staged_bin)
+        .expect("staged binary metadata must read")
+        .permissions();
+    bin_perms.set_mode(0o755);
+    fs::set_permissions(&staged_bin, bin_perms).expect("staged binary must be executable");
+
+    let archive_path = temp_dir.path().join(&archive_name);
+    let tar_status = Command::new("tar")
+        .arg("-C")
+        .arg(&stage_dist)
+        .arg("-czf")
+        .arg(&archive_path)
+        .arg("ov-agy")
+        .status()
+        .expect("system tar must execute");
+    assert!(tar_status.success(), "tar archive creation must succeed");
+
+    let archive_bytes = fs::read(&archive_path).expect("created tar.gz must be readable");
+    let archive_sha256 = hex::encode(sha2::Sha256::digest(&archive_bytes));
+    let good_checksums = format!("{archive_sha256}  {archive_name}\n");
+
+    // 4. Spawn a local HTTP release server with a brief delay to force concurrent overlap.
+    let archive_route = format!("/{archive_name}");
+    let archive_bytes_shared = Arc::new(archive_bytes);
+    let checksums_shared = Arc::new(Mutex::new(good_checksums));
+    let archive_downloads = Arc::new(AtomicUsize::new(0));
+
+    let dl_bytes = Arc::clone(&archive_bytes_shared);
+    let dl_hits = Arc::clone(&archive_downloads);
+    let cs_state = Arc::clone(&checksums_shared);
+
+    let release_router = Router::new()
+        .route(
+            &archive_route,
+            get(move || {
+                let bytes = Arc::clone(&dl_bytes);
+                let hits = Arc::clone(&dl_hits);
+                async move {
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    tokio::time::sleep(Duration::from_millis(40)).await;
+                    (StatusCode::OK, (*bytes).clone())
+                }
+            }),
+        )
+        .route(
+            "/checksums.txt",
+            get(move || {
+                let cs = cs_state
+                    .lock()
+                    .expect("checksums mutex should not be poisoned")
+                    .clone();
+                async move { (StatusCode::OK, cs) }
+            }),
+        );
+
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("release server listener must bind");
+    let release_addr = listener
+        .local_addr()
+        .expect("release server addr must resolve");
+    let release_base_url = format!("http://{release_addr}/");
+    let release_handle = tokio::spawn(async move {
+        let _ = axum::serve(listener, release_router).await;
+    });
+
+    // 5. Launch TWO concurrent cold-start invocations (simulating mcp-proxy + SessionStart).
+    let plugin_data_dir = temp_dir.path().join("plugin-data-good");
+    let home_dir = temp_dir.path().join("empty-home");
+    fs::create_dir_all(&home_dir).expect("empty home dir must create");
+
+    let launcher_a = fake_scripts_dir.join("ov-agy");
+    let root_a = fake_plugin_root.clone();
+    let data_a = plugin_data_dir.clone();
+    let home_a = home_dir.clone();
+    let url_a = release_base_url.clone();
+
+    let task_a = task::spawn_blocking(move || {
+        let child = Command::new(&launcher_a)
+            .arg("--version")
+            .env("PLUGIN_ROOT", &root_a)
+            .env("OPENVIKING_PLUGIN_DATA", &data_a)
+            .env("OPENVIKING_RELEASE_BASE_URL", &url_a)
+            .env("NO_PROXY", "127.0.0.1,localhost")
+            .env("no_proxy", "127.0.0.1,localhost")
+            .env("HOME", &home_a)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("concurrent cold-start process A should spawn");
+        let out = child
+            .wait_with_output()
+            .expect("concurrent cold-start process A should finish");
+        CommandOutput {
+            exit_code: out.status.code().unwrap_or(-1),
+            stdout: String::from_utf8_lossy(&out.stdout).to_string(),
+            stderr: String::from_utf8_lossy(&out.stderr).to_string(),
+        }
+    });
+
+    let launcher_b = fake_scripts_dir.join("ov-agy");
+    let root_b = fake_plugin_root.clone();
+    let data_b = plugin_data_dir.clone();
+    let home_b = home_dir.clone();
+    let url_b = release_base_url.clone();
+
+    let task_b = task::spawn_blocking(move || {
+        let mut child = Command::new(&launcher_b)
+            .args(["hook", "session-start"])
+            .env("PLUGIN_ROOT", &root_b)
+            .env("OPENVIKING_PLUGIN_DATA", &data_b)
+            .env("OPENVIKING_RELEASE_BASE_URL", &url_b)
+            .env("OPENVIKING_MEMORY_ENABLED", "0")
+            .env("NO_PROXY", "127.0.0.1,localhost")
+            .env("no_proxy", "127.0.0.1,localhost")
+            .env("HOME", &home_b)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("concurrent cold-start process B should spawn");
+        if let Some(mut stdin) = child.stdin.take() {
+            stdin
+                .write_all(br#"{"conversationId":"cold-start-race"}"#)
+                .expect("session-start stdin write should succeed");
+        }
+        let out = child
+            .wait_with_output()
+            .expect("concurrent cold-start process B should finish");
+        CommandOutput {
+            exit_code: out.status.code().unwrap_or(-1),
+            stdout: String::from_utf8_lossy(&out.stdout).to_string(),
+            stderr: String::from_utf8_lossy(&out.stderr).to_string(),
+        }
+    });
+
+    let (out_a, out_b) = tokio::join!(task_a, task_b);
+    let out_a = out_a.expect("task A join must succeed");
+    let out_b = out_b.expect("task B join must succeed");
+
+    assert_eq!(
+        out_a.exit_code, 0,
+        "process A cold start failed: stderr={}",
+        out_a.stderr
+    );
+    assert!(
+        out_a.stdout.contains("ov-agy"),
+        "process A stdout should report version, got: {}",
+        out_a.stdout
+    );
+
+    assert_eq!(
+        out_b.exit_code, 0,
+        "process B cold start failed: stderr={}",
+        out_b.stderr
+    );
+    assert_eq!(
+        out_b.stdout.trim(),
+        "{}",
+        "download progress must stay on stderr so hook stdout remains pure JSON"
+    );
+    assert!(
+        archive_downloads.load(Ordering::SeqCst) >= 1,
+        "cold start must fetch archive from OPENVIKING_RELEASE_BASE_URL"
+    );
+
+    let cached_bin = plugin_data_dir.join("bin").join("ov-agy-v9.8.7");
+    assert!(
+        cached_bin.is_file(),
+        "versioned binary ov-agy-v9.8.7 (from plugin.json) must be installed atomically"
+    );
+
+    let bin_entries: Vec<String> = fs::read_dir(plugin_data_dir.join("bin"))
+        .expect("cached bin dir must read")
+        .filter_map(Result::ok)
+        .map(|entry| entry.file_name().to_string_lossy().to_string())
+        .collect();
+    assert_eq!(
+        bin_entries,
+        vec!["ov-agy-v9.8.7".to_string()],
+        "no temporary staging files (.ov-agy.tmp.*) may remain after atomic mv -f"
+    );
+
+    // 6. Verify SHA-256 mismatch aborts before placing any binary.
+    *checksums_shared
+        .lock()
+        .expect("checksums mutex should not be poisoned") = format!(
+        "0000000000000000000000000000000000000000000000000000000000000000  {archive_name}\n"
+    );
+
+    let bad_data_dir = temp_dir.path().join("plugin-data-tampered");
+    let bad_scripts_dir = fake_scripts_dir.clone();
+    let bad_plugin_root = fake_plugin_root.clone();
+    let bad_data_dir_clone = bad_data_dir.clone();
+    let bad_url = release_base_url.clone();
+    let bad_home = home_dir.clone();
+    let bad_out = task::spawn_blocking(move || {
+        Command::new(bad_scripts_dir.join("ov-agy"))
+            .arg("--version")
+            .env("PLUGIN_ROOT", &bad_plugin_root)
+            .env("OPENVIKING_PLUGIN_DATA", &bad_data_dir_clone)
+            .env("OPENVIKING_RELEASE_BASE_URL", &bad_url)
+            .env("NO_PROXY", "127.0.0.1,localhost")
+            .env("no_proxy", "127.0.0.1,localhost")
+            .env("HOME", &bad_home)
+            .output()
+            .expect("tampered cold-start process should execute")
+    })
+    .await
+    .expect("tampered cold-start blocking task should join");
+    assert!(
+        !bad_out.status.success(),
+        "SHA-256 mismatch must fail closed"
+    );
+    assert!(
+        !bad_data_dir.join("bin").join("ov-agy-v9.8.7").exists(),
+        "tampered archive must never be written to destination binary path"
+    );
+
+    release_handle.abort();
+}
