@@ -33,8 +33,12 @@ jobs:
       - name: Run unit & integration tests
         run: cargo test
 
-      - name: Validate JSON manifests
+      - name: Validate JSON manifests & plugin layout
         run: |
           jq empty .antigravity-plugin/plugin.json
           jq empty hooks.json
           jq empty mcp_config.json
+          test ! -e bin
+          test -x scripts/ov-agy
+          test -x scripts/fetch-binary.sh
+          test -f assets/logo.svg
