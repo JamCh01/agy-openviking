@@ -1,4 +1,6 @@
-//! End-to-end integration tests for `ov-agy` against a local mock `axum` OpenViking server.
+//! End-to-end integration tests for `ov-agy` against a local mock `axum` `OpenViking` server.
+
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
@@ -175,7 +177,7 @@ async fn handle_fs_ls(
     Query(params): Query<HashMap<String, String>>,
 ) -> impl IntoResponse {
     record_common_headers(&state, &headers);
-    let uri = params.get("uri").map(String::as_str).unwrap_or("");
+    let uri = params.get("uri").map_or("", String::as_str);
     let entries = match uri {
         "viking://~/skills" => json!([
             {
@@ -339,10 +341,11 @@ async fn handle_mcp_post(
     if method == "initialize" {
         let n = state.mcp_initialize_calls.fetch_add(1, Ordering::SeqCst) + 1;
         let new_sid = format!("mcp-sess-{n}");
-        *state
+        state
             .mcp_active_session
             .lock()
-            .expect("mcp_active_session mutex should not be poisoned") = new_sid.clone();
+            .expect("mcp_active_session mutex should not be poisoned")
+            .clone_from(&new_sid);
 
         let mut resp = Json(json!({
             "jsonrpc": "2.0",

@@ -85,13 +85,10 @@ pub async fn run() -> Result<()> {
             continue;
         }
 
-        let msg: Value = match serde_json::from_str(trimmed) {
-            Ok(val) => val,
-            Err(_) => {
-                let err_frame = jsonrpc_error(Value::Null, -32700, "Parse error", None);
-                write_json_line(&mut stdout, &err_frame).await?;
-                continue;
-            }
+        let Ok(msg) = serde_json::from_str::<Value>(trimmed) else {
+            let err_frame = jsonrpc_error(&Value::Null, -32700, "Parse error", None);
+            write_json_line(&mut stdout, &err_frame).await?;
+            continue;
         };
 
         handle_client_message(&mut state, msg, &mut stdout).await?;
@@ -108,7 +105,7 @@ async fn handle_client_message<W: AsyncWrite + Unpin>(
     stdout: &mut W,
 ) -> Result<()> {
     let Some(obj) = msg.as_object() else {
-        let err_frame = jsonrpc_error(Value::Null, -32600, "Invalid Request", None);
+        let err_frame = jsonrpc_error(&Value::Null, -32600, "Invalid Request", None);
         write_json_line(stdout, &err_frame).await?;
         return Ok(());
     };
@@ -202,7 +199,7 @@ async fn finalize_non_ok_outcome<W: AsyncWrite + Unpin>(
     match outcome {
         UpstreamOutcome::Success => Ok(()),
         UpstreamOutcome::NotFoundExpiredSession => {
-            let frame = jsonrpc_error(req_id, -32002, "OpenViking MCP returned HTTP 404", None);
+            let frame = jsonrpc_error(&req_id, -32002, "OpenViking MCP returned HTTP 404", None);
             write_json_line(stdout, &frame).await
         }
         UpstreamOutcome::HttpError { status, body } => {
@@ -225,12 +222,12 @@ async fn finalize_non_ok_outcome<W: AsyncWrite + Unpin>(
                 let preview: String = body.chars().take(400).collect();
                 Some(json!({ "status": status, "detail": preview }))
             };
-            let frame = jsonrpc_error(req_id, code, &msg, detail);
+            let frame = jsonrpc_error(&req_id, code, &msg, detail);
             write_json_line(stdout, &frame).await
         }
         UpstreamOutcome::TransportError(cause) => {
             let frame = jsonrpc_error(
-                req_id,
+                &req_id,
                 -32001,
                 &format!(
                     "Failed to reach OpenViking MCP endpoint ({})",
@@ -463,7 +460,7 @@ async fn write_json_line<W: AsyncWrite + Unpin>(out: &mut W, val: &Value) -> Res
     Ok(())
 }
 
-fn jsonrpc_error(id: Value, code: i64, message: &str, data: Option<Value>) -> Value {
+fn jsonrpc_error(id: &Value, code: i64, message: &str, data: Option<Value>) -> Value {
     let mut err_obj = Map::new();
     err_obj.insert("code".to_string(), json!(code));
     err_obj.insert("message".to_string(), json!(message));

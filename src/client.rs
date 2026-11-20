@@ -1,5 +1,6 @@
-//! Clean-room HTTP REST client for OpenViking (`/health`, `/api/v1/*`, and `/mcp` probes).
+//! Clean-room HTTP REST client for `OpenViking` (`/health`, `/api/v1/*`, and `/mcp` probes).
 
+use std::fmt::Write as _;
 use std::time::{Duration, Instant};
 
 use reqwest::header::{
@@ -17,7 +18,7 @@ use crate::wire::{
     OvSystemStatusResult,
 };
 
-/// Errors returned by OpenViking HTTP operations.
+/// Errors returned by `OpenViking` HTTP operations.
 #[derive(Debug, Error)]
 pub enum ClientError {
     #[error("network or timeout error: {0}")]
@@ -73,7 +74,7 @@ pub struct McpProbeResult {
     pub error: Option<String>,
 }
 
-/// OpenViking HTTP REST client.
+/// `OpenViking` HTTP REST client.
 #[derive(Clone)]
 pub struct OvClient {
     http: Client,
@@ -90,7 +91,7 @@ impl OvClient {
         Ok(Self { http, cfg })
     }
 
-    /// Builds the standard OpenViking authentication and actor headers for this configuration.
+    /// Builds the standard `OpenViking` authentication and actor headers for this configuration.
     #[must_use]
     pub fn default_headers(&self) -> HeaderMap {
         build_ov_headers(&self.cfg)
@@ -480,7 +481,7 @@ impl OvClient {
     }
 }
 
-/// Builds OpenViking HTTP headers (`Authorization`, `X-API-Key`, `X-OpenViking-*`).
+/// Builds `OpenViking` HTTP headers (`Authorization`, `X-API-Key`, `X-OpenViking-*`).
 #[must_use]
 pub fn build_ov_headers(cfg: &ResolvedConfig) -> HeaderMap {
     let mut headers = HeaderMap::new();
@@ -530,8 +531,7 @@ fn render_search_result(res: &OvSearchResult) -> Option<String> {
         if stats
             .rewrite
             .as_deref()
-            .map(|r| r.eq_ignore_ascii_case("no_relevant"))
-            .unwrap_or(false)
+            .is_some_and(|r| r.eq_ignore_ascii_case("no_relevant"))
         {
             return None;
         }
@@ -560,8 +560,7 @@ fn render_search_result(res: &OvSearchResult) -> Option<String> {
                 .as_deref()
                 .or(entry.content.as_deref())
                 .or(entry.abstract_text.as_deref())
-                .map(str::trim)
-                .unwrap_or("");
+                .map_or("", str::trim);
             if body.is_empty() {
                 lines.push(format!("- [{cat}] {}", entry.uri));
             } else {
@@ -601,8 +600,7 @@ fn format_matched_items(items: &[OvMatchedItem]) -> Option<String> {
             .as_deref()
             .or(item.abstract_text.as_deref())
             .or(item.overview.as_deref())
-            .map(str::trim)
-            .unwrap_or("");
+            .map_or("", str::trim);
         if summary.is_empty() {
             lines.push(format!("- [{kind}] {}", item.uri));
         } else {
@@ -633,8 +631,7 @@ fn parse_http_error(status: u16, text: &str) -> ClientError {
             let msg = err_obj
                 .get("message")
                 .and_then(Value::as_str)
-                .map(ToString::to_string)
-                .unwrap_or_else(|| format!("HTTP {status}"));
+                .map_or_else(|| format!("HTTP {status}"), ToString::to_string);
             return ClientError::HttpStatus {
                 status,
                 code,
@@ -660,7 +657,7 @@ fn urlencoding_segment(raw: &str) -> String {
         if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
             out.push(byte as char);
         } else {
-            out.push_str(&format!("%{byte:02X}"));
+            let _ = write!(out, "%{byte:02X}");
         }
     }
     out

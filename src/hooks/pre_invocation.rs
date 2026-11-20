@@ -1,4 +1,4 @@
-//! `PreInvocation` hook performing turn-deduplicated OpenViking context recall.
+//! `PreInvocation` hook performing turn-deduplicated `OpenViking` context recall.
 
 use std::path::Path;
 use std::time::Duration;
@@ -149,7 +149,7 @@ async fn run_inner(raw_stdin: &str) -> InjectOutput {
         ov_session_id,
         peer_id: cfg.peer_id.clone(),
         query_preview: filtered.text.chars().take(160).collect(),
-        injected_chars: formatted_block.as_ref().map(String::len).unwrap_or(0),
+        injected_chars: formatted_block.as_ref().map_or(0, String::len),
         injected: formatted_block.is_some(),
     };
     let _ = config::write_json_atomic(&cfg.last_recall_path(), &snapshot);

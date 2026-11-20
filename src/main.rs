@@ -181,15 +181,14 @@ async fn run_doctor(args: DoctorArgs) {
         }
     }
 
-    let peer_source = if !cfg.peer_id.is_empty() {
+    let peer_source = if cfg.peer_id.is_empty() {
+        None
+    } else {
         Some(
             cfg.peer_resolution
                 .as_ref()
-                .map(|r| r.source.to_string())
-                .unwrap_or_else(|| "explicit_config".to_string()),
+                .map_or_else(|| "explicit_config".to_string(), |r| r.source.to_string()),
         )
-    } else {
-        None
     };
 
     let workspace_config_paths: Vec<String> = cfg
@@ -224,11 +223,7 @@ async fn run_doctor(args: DoctorArgs) {
             Some(cfg.peer_id.clone())
         },
         peer_source,
-        git_is_worktree: cfg
-            .peer_resolution
-            .as_ref()
-            .map(|r| r.is_worktree)
-            .unwrap_or(false),
+        git_is_worktree: cfg.peer_resolution.as_ref().is_some_and(|r| r.is_worktree),
         cli_config_path: cfg
             .cli_config_path
             .as_ref()
@@ -257,6 +252,9 @@ async fn run_doctor(args: DoctorArgs) {
     }
 }
 
+// `doctor` (without `--json`) renders human-facing CLI diagnostics directly to the terminal;
+// lifecycle hooks and `mcp-proxy` never call this function.
+#[allow(clippy::print_stdout)]
 fn print_human_doctor_report(report: &DoctorReport) {
     let mut lines = Vec::new();
     lines.push(format!(
@@ -290,8 +288,7 @@ fn print_human_doctor_report(report: &DoctorReport) {
             if ok { "OK" } else { "FAILED" },
             report
                 .health_latency_ms
-                .map(|m| m.to_string())
-                .unwrap_or_else(|| "-".to_string()),
+                .map_or_else(|| "-".to_string(), |m| m.to_string()),
             report.server_version.as_deref().unwrap_or("-"),
             report.server_auth_mode.as_deref().unwrap_or("-")
         ));
@@ -305,8 +302,7 @@ fn print_human_doctor_report(report: &DoctorReport) {
             if ok { "OK" } else { "FAILED" },
             report
                 .mcp_status_code
-                .map(|c| c.to_string())
-                .unwrap_or_else(|| "-".to_string()),
+                .map_or_else(|| "-".to_string(), |c| c.to_string()),
             report.mcp_session_id_present.unwrap_or(false)
         ));
     } else {
@@ -324,5 +320,5 @@ fn print_human_doctor_report(report: &DoctorReport) {
         }
     }
 
-    write_stdout_raw_line(&lines.join("\n"));
+    println!("{}", lines.join("\n"));
 }

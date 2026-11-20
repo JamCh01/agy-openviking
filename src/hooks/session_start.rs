@@ -171,14 +171,12 @@ fn format_available_skills(
                 .as_deref()
                 .map(str::trim)
                 .filter(|u| !u.is_empty())
-                .map(ToString::to_string)
-                .unwrap_or_else(|| format!("{scope_uri}/{skill_name}"));
+                .map_or_else(|| format!("{scope_uri}/{skill_name}"), ToString::to_string);
             let summary = entry
                 .abstract_text
                 .as_deref()
                 .or(entry.overview.as_deref())
-                .map(|s| s.lines().next().unwrap_or("").trim())
-                .unwrap_or("");
+                .map_or("", |s| s.lines().next().unwrap_or("").trim());
 
             if summary.is_empty() {
                 lines.push(format!("- {skill_name} ({canonical_uri})"));

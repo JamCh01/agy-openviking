@@ -34,7 +34,7 @@ fn short_hash(value: &str) -> String {
     digest[..12].to_string()
 }
 
-/// Sanitizes an arbitrary identifier into a canonical OpenViking `peer` ID.
+/// Sanitizes an arbitrary identifier into a canonical `OpenViking` `peer` ID.
 #[must_use]
 pub fn sanitize_peer_id(raw_input: &str) -> String {
     let raw = raw_input.trim();
@@ -172,9 +172,8 @@ pub fn read_git_remote_url(common_dir: &Path, remote_name: &str) -> Option<Strin
         if let Some(rest) = trimmed.strip_prefix('[') {
             if let Some(end_bracket) = rest.find(']') {
                 let header = rest[..end_bracket].trim();
-                in_target_remote = parse_remote_section_name(header)
-                    .map(|name| name == remote_name)
-                    .unwrap_or(false);
+                in_target_remote =
+                    parse_remote_section_name(header).is_some_and(|name| name == remote_name);
                 continue;
             }
         }
@@ -333,8 +332,7 @@ pub fn resolve_git_peer(start_dir: &Path, home_dir: Option<&Path>) -> Option<Pee
             let fallback_base = if git_info
                 .common_dir
                 .file_name()
-                .map(|name| name == ".git")
-                .unwrap_or(false)
+                .is_some_and(|name| name == ".git")
             {
                 git_info
                     .common_dir

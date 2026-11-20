@@ -86,15 +86,18 @@ impl ResolvedConfig {
             .or_else(dirs::home_dir)
             .unwrap_or_else(|| PathBuf::from("."));
 
-        let ov_home_dir = env_non_empty(env, "OPENVIKING_HOME")
-            .map(|p| expand_tilde(&p, &home_dir))
-            .unwrap_or_else(|| home_dir.join(".openviking"));
+        let ov_home_dir = env_non_empty(env, "OPENVIKING_HOME").map_or_else(
+            || home_dir.join(".openviking"),
+            |p| expand_tilde(&p, &home_dir),
+        );
 
         let state_dir = env_non_empty(env, "OPENVIKING_PLUGIN_DATA")
             .or_else(|| env_non_empty(env, "PLUGIN_DATA"))
             .or_else(|| env_non_empty(env, "OPENVIKING_STATE_DIR"))
-            .map(|p| expand_tilde(&p, &home_dir))
-            .unwrap_or_else(|| ov_home_dir.join("agy-plugin"));
+            .map_or_else(
+                || ov_home_dir.join("agy-plugin"),
+                |p| expand_tilde(&p, &home_dir),
+            );
 
         let cred_mode = match env_non_empty(env, "OPENVIKING_CREDENTIAL_SOURCE")
             .or_else(|| env_non_empty(env, "OPENVIKING_CREDENTIALS_SOURCE"))
@@ -109,22 +112,24 @@ impl ResolvedConfig {
 
         let mut warnings = Vec::new();
 
-        let cli_candidate = env_non_empty(env, "OPENVIKING_CLI_CONFIG_FILE")
-            .map(|p| expand_tilde(&p, &home_dir))
-            .unwrap_or_else(|| ov_home_dir.join("ovcli.conf"));
-        let ov_candidate = env_non_empty(env, "OPENVIKING_CONFIG_FILE")
-            .map(|p| expand_tilde(&p, &home_dir))
-            .unwrap_or_else(|| ov_home_dir.join("ov.conf"));
+        let cli_candidate = env_non_empty(env, "OPENVIKING_CLI_CONFIG_FILE").map_or_else(
+            || ov_home_dir.join("ovcli.conf"),
+            |p| expand_tilde(&p, &home_dir),
+        );
+        let ov_candidate = env_non_empty(env, "OPENVIKING_CONFIG_FILE").map_or_else(
+            || ov_home_dir.join("ov.conf"),
+            |p| expand_tilde(&p, &home_dir),
+        );
 
-        let (mut cli_json, mut cli_path) = if cred_mode != CredentialMode::Env {
+        let (mut cli_json, mut cli_path) = if cred_mode == CredentialMode::Env {
+            (None, None)
+        } else {
             load_json_object(&cli_candidate, &mut warnings)
-        } else {
-            (None, None)
         };
-        let (mut ov_json, mut ov_path) = if cred_mode != CredentialMode::Env {
-            load_json_object(&ov_candidate, &mut warnings)
-        } else {
+        let (mut ov_json, mut ov_path) = if cred_mode == CredentialMode::Env {
             (None, None)
+        } else {
+            load_json_object(&ov_candidate, &mut warnings)
         };
 
         // Backward compatibility: treat ovcli-shaped `OPENVIKING_CONFIG_FILE` as `ovcli.conf`.
@@ -132,7 +137,7 @@ impl ResolvedConfig {
             && env_non_empty(env, "OPENVIKING_CONFIG_FILE").is_some()
             && env_non_empty(env, "OPENVIKING_CLI_CONFIG_FILE").is_none()
             && cli_json.is_none()
-            && ov_json.as_ref().map(looks_like_ovcli).unwrap_or(false)
+            && ov_json.as_ref().is_some_and(looks_like_ovcli)
         {
             cli_json = ov_json.take();
             cli_path = ov_path.take();
@@ -256,7 +261,7 @@ impl ResolvedConfig {
             if allow_file_creds && cred_mode != CredentialMode::Cli {
                 (
                     ov_server
-                        .and_then(|s| json_str(s.get("url")).or_else(|| derive_ov_server_url(s))),
+                        .map(|s| json_str(s.get("url")).unwrap_or_else(|| derive_ov_server_url(s))),
                     "ov.conf",
                 )
             } else {
@@ -342,10 +347,10 @@ impl ResolvedConfig {
         ])
         .unwrap_or_else(|| (String::new(), "none"));
 
-        let credential_source = if key_source != "none" {
-            key_source.to_string()
-        } else {
+        let credential_source = if key_source == "none" {
             url_source.to_string()
+        } else {
+            key_source.to_string()
         };
 
         // 3. Root API key misconfiguration guard.
@@ -509,8 +514,10 @@ impl ResolvedConfig {
 
         let debug_log_path = env_non_empty(env, "OPENVIKING_DEBUG_LOG")
             .or_else(|| layer_str(&layers, &["debugLogPath"]))
-            .map(|p| expand_tilde(&p, &home_dir))
-            .unwrap_or_else(|| ov_home_dir.join("logs").join("agy.jsonl"));
+            .map_or_else(
+                || ov_home_dir.join("logs").join("agy.jsonl"),
+                |p| expand_tilde(&p, &home_dir),
+            );
 
         let timeout_ms = env_u64(env, "OPENVIKING_TIMEOUT_MS")
             .or_else(|| layer_u64(&layers, &["timeoutMs", "requestTimeoutMs"]))
@@ -518,29 +525,48 @@ impl ResolvedConfig {
             .clamp(500, 300_000);
 
         let auto_recall = env_bool(env, "OPENVIKING_AUTO_RECALL")
-            .or_else(|| ws_nested_bool(&ws_local, &ws_team, &["recall", "enabled"]))
+            .or_else(|| ws_nested_bool(ws_local.as_ref(), ws_team.as_ref(), &["recall", "enabled"]))
             .or_else(|| layer_bool(&layers, &["autoRecall"]))
             .unwrap_or(true);
 
         let auto_capture = env_bool(env, "OPENVIKING_AUTO_CAPTURE")
-            .or_else(|| ws_nested_bool(&ws_local, &ws_team, &["capture", "enabled"]))
+            .or_else(|| {
+                ws_nested_bool(ws_local.as_ref(), ws_team.as_ref(), &["capture", "enabled"])
+            })
             .or_else(|| layer_bool(&layers, &["autoCapture", "syncTurns"]))
             .unwrap_or(true);
 
         let recall_limit = env_usize(env, "OPENVIKING_RECALL_LIMIT")
-            .or_else(|| ws_nested_usize(&ws_local, &ws_team, &["recall", "max_items"]))
+            .or_else(|| {
+                ws_nested_usize(
+                    ws_local.as_ref(),
+                    ws_team.as_ref(),
+                    &["recall", "max_items"],
+                )
+            })
             .or_else(|| layer_usize(&layers, &["recallLimit"]))
             .unwrap_or(DEFAULT_RECALL_LIMIT)
             .clamp(1, 50);
 
         let recall_dedup_turns = env_usize(env, "OPENVIKING_RECALL_DEDUP_TURNS")
-            .or_else(|| ws_nested_usize(&ws_local, &ws_team, &["recall", "dedup_turns"]))
+            .or_else(|| {
+                ws_nested_usize(
+                    ws_local.as_ref(),
+                    ws_team.as_ref(),
+                    &["recall", "dedup_turns"],
+                )
+            })
             .or_else(|| layer_usize(&layers, &["recallDedupTurns"]))
-            .map(|v| v.min(20) as u32)
-            .unwrap_or(DEFAULT_RECALL_DEDUP_TURNS);
+            .map_or(DEFAULT_RECALL_DEDUP_TURNS, |v| v.min(20) as u32);
 
         let score_threshold = env_f64(env, "OPENVIKING_SCORE_THRESHOLD")
-            .or_else(|| ws_nested_f64(&ws_local, &ws_team, &["recall", "score_threshold"]))
+            .or_else(|| {
+                ws_nested_f64(
+                    ws_local.as_ref(),
+                    ws_team.as_ref(),
+                    &["recall", "score_threshold"],
+                )
+            })
             .or_else(|| layer_f64(&layers, &["scoreThreshold", "recallScoreThreshold"]))
             .unwrap_or(DEFAULT_SCORE_THRESHOLD)
             .clamp(0.0, 1.0);
@@ -551,7 +577,13 @@ impl ResolvedConfig {
             .clamp(1, 64);
 
         let recall_peer_scope = env_non_empty(env, "OPENVIKING_RECALL_PEER_SCOPE")
-            .or_else(|| ws_nested_str(&ws_local, &ws_team, &["recall", "peer_scope"]))
+            .or_else(|| {
+                ws_nested_str(
+                    ws_local.as_ref(),
+                    ws_team.as_ref(),
+                    &["recall", "peer_scope"],
+                )
+            })
             .or_else(|| layer_str(&layers, &["recallPeerScope"]))
             .map(|s| s.to_ascii_lowercase())
             .filter(|s| s == "actor" || s == "all")
@@ -667,13 +699,12 @@ pub fn is_env_explicitly_disabled() -> bool {
 /// Appends a structured JSONL event to `log_path` (never `stdout`).
 pub fn append_debug_jsonl(log_path: &Path, component: &str, stage: &str, detail: Value) {
     let ts_ms = now_epoch_ms();
-    let entry = json!({
-        "ts_ms": ts_ms,
-        "pid": std::process::id(),
-        "component": component,
-        "stage": stage,
-        "detail": detail,
-    });
+    let mut entry = Map::with_capacity(5);
+    entry.insert("ts_ms".to_string(), json!(ts_ms));
+    entry.insert("pid".to_string(), json!(std::process::id()));
+    entry.insert("component".to_string(), json!(component));
+    entry.insert("stage".to_string(), json!(stage));
+    entry.insert("detail".to_string(), detail);
     if let Some(parent) = log_path.parent() {
         let _ = fs::create_dir_all(parent);
     }
@@ -701,15 +732,16 @@ pub fn debug_log_from_env(component: &str, stage: &str, detail: Value) {
     let log_path = std::env::var("OPENVIKING_DEBUG_LOG")
         .ok()
         .filter(|s| !s.trim().is_empty())
-        .map(|p| expand_tilde(&p, &home))
-        .unwrap_or_else(|| {
-            let ov_home = std::env::var("OPENVIKING_HOME")
-                .ok()
-                .filter(|s| !s.trim().is_empty())
-                .map(|p| expand_tilde(&p, &home))
-                .unwrap_or_else(|| home.join(".openviking"));
-            ov_home.join("logs").join("agy.jsonl")
-        });
+        .map_or_else(
+            || {
+                let ov_home = std::env::var("OPENVIKING_HOME")
+                    .ok()
+                    .filter(|s| !s.trim().is_empty())
+                    .map_or_else(|| home.join(".openviking"), |p| expand_tilde(&p, &home));
+                ov_home.join("logs").join("agy.jsonl")
+            },
+            |p| expand_tilde(&p, &home),
+        );
     append_debug_jsonl(&log_path, component, stage, detail);
 }
 
@@ -718,8 +750,7 @@ pub fn debug_log_from_env(component: &str, stage: &str, detail: Value) {
 pub fn now_epoch_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
+        .map_or(0, |d| d.as_millis() as u64)
 }
 
 /// Sanitizes an arbitrary identifier for safe single-segment filenames.
@@ -954,14 +985,14 @@ fn parse_delimited_rule(
     delim: char,
     body: &str,
 ) -> Option<CompiledFilter> {
-    let (pattern, after_first) = scan_delimited(body, delim)?;
+    let (pattern, after_first) = scan_delimited(body, delim);
     if pattern.is_empty() {
         return None;
     }
 
     let (op, flags_str) = if op_char == 's' {
         let after_idx = after_first?;
-        let (replacement, after_second) = scan_delimited(&body[after_idx..], delim)?;
+        let (replacement, after_second) = scan_delimited(&body[after_idx..], delim);
         let after_rep_idx = after_second?;
         let flags = &body[after_idx + after_rep_idx..];
         let global = flags.contains('g');
@@ -1005,7 +1036,7 @@ fn parse_delimited_rule(
     Some(CompiledFilter { scope, regex, op })
 }
 
-fn scan_delimited(input: &str, delim: char) -> Option<(String, Option<usize>)> {
+fn scan_delimited(input: &str, delim: char) -> (String, Option<usize>) {
     let mut out = String::new();
     let mut iter = input.char_indices();
     while let Some((idx, ch)) = iter.next() {
@@ -1023,11 +1054,11 @@ fn scan_delimited(input: &str, delim: char) -> Option<(String, Option<usize>)> {
             continue;
         }
         if ch == delim {
-            return Some((out, Some(idx + ch.len_utf8())));
+            return (out, Some(idx + ch.len_utf8()));
         }
         out.push(ch);
     }
-    Some((out, None))
+    (out, None)
 }
 
 /// Applies compiled filter rules in order for the given `role` (`"user"` or `"assistant"`).
@@ -1190,12 +1221,12 @@ fn looks_like_ovcli(map: &Map<String, Value>) -> bool {
         .any(|key| map.contains_key(*key))
 }
 
-fn derive_ov_server_url(server: &Map<String, Value>) -> Option<String> {
+fn derive_ov_server_url(server: &Map<String, Value>) -> String {
     let host = json_str(server.get("host"))
         .unwrap_or_else(|| "127.0.0.1".to_string())
         .replace("0.0.0.0", "127.0.0.1");
     let port = server.get("port").and_then(Value::as_u64).unwrap_or(1933);
-    Some(format!("http://{host}:{port}"))
+    format!("http://{host}:{port}")
 }
 
 fn json_str(val: Option<&Value>) -> Option<String> {
@@ -1251,55 +1282,43 @@ fn nested_str(map: &Map<String, Value>, path: &[&str]) -> Option<String> {
 }
 
 fn ws_nested_bool(
-    ws_local: &Option<Map<String, Value>>,
-    ws_team: &Option<Map<String, Value>>,
+    ws_local: Option<&Map<String, Value>>,
+    ws_team: Option<&Map<String, Value>>,
     path: &[&str],
 ) -> Option<bool> {
     ws_local
-        .as_ref()
         .and_then(|m| json_bool(nested_val(m, path)))
-        .or_else(|| {
-            ws_team
-                .as_ref()
-                .and_then(|m| json_bool(nested_val(m, path)))
-        })
+        .or_else(|| ws_team.and_then(|m| json_bool(nested_val(m, path))))
 }
 
 fn ws_nested_usize(
-    ws_local: &Option<Map<String, Value>>,
-    ws_team: &Option<Map<String, Value>>,
+    ws_local: Option<&Map<String, Value>>,
+    ws_team: Option<&Map<String, Value>>,
     path: &[&str],
 ) -> Option<usize> {
     ws_local
-        .as_ref()
         .and_then(|m| json_u64(nested_val(m, path)).map(|v| v as usize))
-        .or_else(|| {
-            ws_team
-                .as_ref()
-                .and_then(|m| json_u64(nested_val(m, path)).map(|v| v as usize))
-        })
+        .or_else(|| ws_team.and_then(|m| json_u64(nested_val(m, path)).map(|v| v as usize)))
 }
 
 fn ws_nested_f64(
-    ws_local: &Option<Map<String, Value>>,
-    ws_team: &Option<Map<String, Value>>,
+    ws_local: Option<&Map<String, Value>>,
+    ws_team: Option<&Map<String, Value>>,
     path: &[&str],
 ) -> Option<f64> {
     ws_local
-        .as_ref()
         .and_then(|m| json_f64(nested_val(m, path)))
-        .or_else(|| ws_team.as_ref().and_then(|m| json_f64(nested_val(m, path))))
+        .or_else(|| ws_team.and_then(|m| json_f64(nested_val(m, path))))
 }
 
 fn ws_nested_str(
-    ws_local: &Option<Map<String, Value>>,
-    ws_team: &Option<Map<String, Value>>,
+    ws_local: Option<&Map<String, Value>>,
+    ws_team: Option<&Map<String, Value>>,
     path: &[&str],
 ) -> Option<String> {
     ws_local
-        .as_ref()
         .and_then(|m| nested_str(m, path))
-        .or_else(|| ws_team.as_ref().and_then(|m| nested_str(m, path)))
+        .or_else(|| ws_team.and_then(|m| nested_str(m, path)))
 }
 
 fn layer_str(layers: &[&Map<String, Value>], keys: &[&str]) -> Option<String> {

@@ -30,8 +30,7 @@ pub fn run_sync(raw_stdin: &str) -> PreToolOutput {
         let has_viking_in_call = parsed
             .tool_call
             .as_ref()
-            .map(|tc| contains_viking_uri(&tc.args))
-            .unwrap_or(false);
+            .is_some_and(|tc| contains_viking_uri(&tc.args));
         let has_viking_in_flat = contains_viking_uri(&parsed.tool_input);
 
         if has_viking_in_call || has_viking_in_flat {

@@ -35,77 +35,75 @@ pub struct TranscriptDelta {
     pub new_byte_offset: u64,
 }
 
-fn re_ov_context() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| {
-        Regex::new(r"(?is)<openviking-context\b[^>]*>.*?</openviking-context>")
-            .expect("static openviking-context regex literal must be valid")
-    })
+fn compiled_regex(
+    slot: &'static OnceLock<Option<Regex>>,
+    pattern: &'static str,
+) -> Option<&'static Regex> {
+    slot.get_or_init(|| Regex::new(pattern).ok()).as_ref()
 }
 
-fn re_ov_session() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| {
-        Regex::new(r"(?is)<openviking-session\b[^>]*>.*?</openviking-session>")
-            .expect("static openviking-session regex literal must be valid")
-    })
+fn replace_tag_pattern(
+    input: &str,
+    slot: &'static OnceLock<Option<Regex>>,
+    pattern: &'static str,
+) -> String {
+    match compiled_regex(slot, pattern) {
+        Some(re) => re.replace_all(input, "").into_owned(),
+        None => input.to_string(),
+    }
 }
 
-fn re_available_skills() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| {
-        Regex::new(r"(?is)<available-skills\b[^>]*>.*?</available-skills>")
-            .expect("static available-skills regex literal must be valid")
-    })
+fn re_user_request_unwrap() -> Option<&'static Regex> {
+    static RE: OnceLock<Option<Regex>> = OnceLock::new();
+    compiled_regex(&RE, r"(?is)<user_request\b[^>]*>(.*?)</user_request>")
 }
 
-fn re_additional_metadata() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| {
-        Regex::new(r"(?is)<additional_metadata\b[^>]*>.*?</additional_metadata>")
-            .expect("static additional_metadata regex literal must be valid")
-    })
-}
-
-fn re_user_settings_change() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| {
-        Regex::new(r"(?is)<user_settings_change\b[^>]*>.*?</user_settings_change>")
-            .expect("static user_settings_change regex literal must be valid")
-    })
-}
-
-fn re_user_request_unwrap() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| {
-        Regex::new(r"(?is)<user_request\b[^>]*>(.*?)</user_request>")
-            .expect("static user_request regex literal must be valid")
-    })
-}
-
-/// Strips injected OpenViking XML blocks (`<openviking-context>`, `<openviking-session>`,
+/// Strips injected `OpenViking` XML blocks (`<openviking-context>`, `<openviking-session>`,
 /// `<available-skills>`) and Antigravity system metadata wrappers from text.
 #[must_use]
 pub fn strip_injected_blocks(raw: &str) -> String {
-    let mut cleaned = re_ov_context().replace_all(raw, "").into_owned();
-    cleaned = re_ov_session().replace_all(&cleaned, "").into_owned();
-    cleaned = re_available_skills().replace_all(&cleaned, "").into_owned();
-    cleaned = re_additional_metadata()
-        .replace_all(&cleaned, "")
-        .into_owned();
-    cleaned = re_user_settings_change()
-        .replace_all(&cleaned, "")
-        .into_owned();
+    static RE_OV_CONTEXT: OnceLock<Option<Regex>> = OnceLock::new();
+    static RE_OV_SESSION: OnceLock<Option<Regex>> = OnceLock::new();
+    static RE_AVAILABLE_SKILLS: OnceLock<Option<Regex>> = OnceLock::new();
+    static RE_ADDITIONAL_METADATA: OnceLock<Option<Regex>> = OnceLock::new();
+    static RE_USER_SETTINGS_CHANGE: OnceLock<Option<Regex>> = OnceLock::new();
 
-    if let Some(caps) = re_user_request_unwrap().captures(&cleaned) {
-        if let Some(inner) = caps.get(1) {
-            let rest = re_user_request_unwrap().replace_all(&cleaned, "");
-            if rest.trim().is_empty() {
-                cleaned = inner.as_str().to_string();
-            } else {
-                let inner_trimmed = inner.as_str().trim();
-                let rest_trimmed = rest.trim();
-                cleaned = format!("{inner_trimmed}\n{rest_trimmed}");
+    let mut cleaned = replace_tag_pattern(
+        raw,
+        &RE_OV_CONTEXT,
+        r"(?is)<openviking-context\b[^>]*>.*?</openviking-context>",
+    );
+    cleaned = replace_tag_pattern(
+        &cleaned,
+        &RE_OV_SESSION,
+        r"(?is)<openviking-session\b[^>]*>.*?</openviking-session>",
+    );
+    cleaned = replace_tag_pattern(
+        &cleaned,
+        &RE_AVAILABLE_SKILLS,
+        r"(?is)<available-skills\b[^>]*>.*?</available-skills>",
+    );
+    cleaned = replace_tag_pattern(
+        &cleaned,
+        &RE_ADDITIONAL_METADATA,
+        r"(?is)<additional_metadata\b[^>]*>.*?</additional_metadata>",
+    );
+    cleaned = replace_tag_pattern(
+        &cleaned,
+        &RE_USER_SETTINGS_CHANGE,
+        r"(?is)<user_settings_change\b[^>]*>.*?</user_settings_change>",
+    );
+    if let Some(re) = re_user_request_unwrap() {
+        if let Some(caps) = re.captures(&cleaned) {
+            if let Some(inner) = caps.get(1) {
+                let rest = re.replace_all(&cleaned, "");
+                if rest.trim().is_empty() {
+                    cleaned = inner.as_str().to_string();
+                } else {
+                    let inner_trimmed = inner.as_str().trim();
+                    let rest_trimmed = rest.trim();
+                    cleaned = format!("{inner_trimmed}\n{rest_trimmed}");
+                }
             }
         }
     }
@@ -113,7 +111,7 @@ pub fn strip_injected_blocks(raw: &str) -> String {
     cleaned.trim().to_string()
 }
 
-/// Sanitizes a captured turn prior to sending to OpenViking `/sessions/{id}/messages`:
+/// Sanitizes a captured turn prior to sending to `OpenViking` `/sessions/{id}/messages`:
 /// 1. Strips injected `<openviking-context>`, `<openviking-session>`, and `<available-skills>` blocks.
 /// 2. Applies `captureFilters` regex rules.
 /// 3. Truncates safely on a UTF-8 character boundary to `max_chars`.
@@ -178,15 +176,12 @@ pub fn extract_latest_user_turn_tail(path: &Path) -> Option<LatestUserTurn> {
     while cursor < buf.len() {
         let line_start = cursor;
         let next_nl = buf[cursor..].iter().position(|&b| b == b'\n');
-        let line_end = match next_nl {
-            Some(rel) => {
-                cursor += rel + 1;
-                line_start + rel
-            }
-            None => {
-                cursor = buf.len();
-                buf.len()
-            }
+        let line_end = if let Some(rel) = next_nl {
+            cursor += rel + 1;
+            line_start + rel
+        } else {
+            cursor = buf.len();
+            buf.len()
         };
 
         let line_bytes = &buf[line_start..line_end];

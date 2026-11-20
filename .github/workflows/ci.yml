@@ -3,7 +3,13 @@ name: CI
 on:
   push:
     branches: [main]
+    paths-ignore:
+      - "README*.md"
+      - "docs/**"
   pull_request:
+    paths-ignore:
+      - "README*.md"
+      - "docs/**"
 
 env:
   CARGO_TERM_COLOR: always
@@ -16,22 +22,20 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
+      - name: Install Rust toolchain from rust-toolchain.toml
+        uses: dtolnay/rust-toolchain@master
 
       - name: Cache Cargo registry & build artifacts
         uses: Swatinem/rust-cache@v2
 
       - name: Check formatting
-        run: cargo fmt --check
+        run: cargo fmt --all -- --check
 
       - name: Run Clippy lints
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --locked --all-targets -- -D warnings
 
       - name: Run unit & integration tests
-        run: cargo test
+        run: cargo test --locked
 
       - name: Validate JSON manifests & plugin layout
         run: |
@@ -42,3 +46,18 @@ jobs:
           test -x scripts/ov-agy
           test -x scripts/fetch-binary.sh
           test -f assets/logo.svg
+
+  deny:
+    name: Supply-Chain & License Audit (cargo-deny)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain from rust-toolchain.toml
+        uses: dtolnay/rust-toolchain@master
+
+      - name: Run cargo-deny check
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          arguments: --locked

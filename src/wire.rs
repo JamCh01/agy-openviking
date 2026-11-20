@@ -1,4 +1,4 @@
-//! Wire protocol types for Antigravity CLI hooks, OpenViking REST APIs, and local state.
+//! Wire protocol types for Antigravity CLI hooks, `OpenViking` REST APIs, and local state.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -80,7 +80,7 @@ impl PreToolInput {
                 }
             }
         }
-        self.tool_name.as_deref().map(str::trim).unwrap_or("")
+        self.tool_name.as_deref().map_or("", str::trim)
     }
 }
 
@@ -186,7 +186,7 @@ impl PreToolOutput {
 
 // ── OpenViking HTTP REST Wire Types ────────────────────────────────────────
 
-/// Error payload inside an OpenViking JSON response envelope.
+/// Error payload inside an `OpenViking` JSON response envelope.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct OvApiError {
     #[serde(default)]
@@ -195,7 +195,7 @@ pub struct OvApiError {
     pub message: Option<String>,
 }
 
-/// Standard OpenViking HTTP JSON response wrapper.
+/// Standard `OpenViking` HTTP JSON response wrapper.
 #[derive(Debug, Clone, Deserialize)]
 pub struct OvEnvelope<T> {
     #[serde(default)]
@@ -333,7 +333,7 @@ pub struct OvSearchResult {
     pub skills: Vec<OvMatchedItem>,
 }
 
-/// Single message part in OpenViking session message payloads.
+/// Single message part in `OpenViking` session message payloads.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OvMessagePart {
     #[serde(rename = "type")]

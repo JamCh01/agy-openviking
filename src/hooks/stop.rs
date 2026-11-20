@@ -27,8 +27,7 @@ pub fn run_sync(raw_stdin: &str) -> &'static str {
     let is_error_stop = parsed
         .termination_reason
         .as_deref()
-        .map(|reason| reason.trim().eq_ignore_ascii_case("error"))
-        .unwrap_or(false);
+        .is_some_and(|reason| reason.trim().eq_ignore_ascii_case("error"));
 
     if !fully_idle || is_error_stop {
         config::debug_log_from_env(
