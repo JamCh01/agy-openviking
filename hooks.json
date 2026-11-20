@@ -1,0 +1,38 @@
+{
+  "openviking": {
+    "enabled": true,
+    "SessionStart": [
+      {
+        "type": "command",
+        "command": "./bin/ov-agy hook session-start",
+        "timeout": 5
+      }
+    ],
+    "PreInvocation": [
+      {
+        "type": "command",
+        "command": "./bin/ov-agy hook pre-invocation",
+        "timeout": 5
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "view_file|write_to_file|replace_file_content|multi_replace_file_content|list_dir|grep_search",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "./bin/ov-agy hook pre-tool",
+            "timeout": 2
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "type": "command",
+        "command": "./bin/ov-agy hook stop",
+        "timeout": 5
+      }
+    ]
+  }
+}
