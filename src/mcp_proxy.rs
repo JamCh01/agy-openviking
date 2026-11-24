@@ -1,5 +1,7 @@
 //! Stdio <-> Streamable HTTP (`/mcp`) JSON-RPC proxy with SSE streaming and session recovery.
 
+use std::collections::VecDeque;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
@@ -8,7 +10,7 @@ use futures_util::StreamExt;
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue, ACCEPT, CONTENT_TYPE};
 use reqwest::Client;
 use serde_json::{json, Map, Value};
-use tokio::io::{self, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader, Sink};
+use tokio::io::{self, AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader, Sink};
 
 use crate::client;
 use crate::config::ResolvedConfig;
@@ -53,7 +55,7 @@ enum UpstreamOutcome {
 
 /// Runs the newline-delimited stdio JSON-RPC bridge until `stdin` reaches EOF.
 pub async fn run() -> Result<()> {
-    let cfg = ResolvedConfig::load(None);
+    let cfg = workspace_config(None);
     let http = Client::builder()
         .connect_timeout(Duration::from_millis(cfg.timeout_ms.min(5_000)))
         .timeout(Duration::from_millis(cfg.timeout_ms.max(60_000)))
@@ -79,24 +81,137 @@ pub async fn run() -> Result<()> {
     let mut stdout = io::stdout();
     let mut lines = BufReader::new(stdin).lines();
 
-    while let Ok(Some(line)) = lines.next_line().await {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-
-        let Ok(msg) = serde_json::from_str::<Value>(trimmed) else {
-            let err_frame = jsonrpc_error(&Value::Null, -32700, "Parse error", None);
-            write_json_line(&mut stdout, &err_frame).await?;
-            continue;
+    let mut pending = VecDeque::new();
+    let mut roots_supported = false;
+    let mut refresh_roots = false;
+    let mut roots_seq = 0_u64;
+    loop {
+        let msg = if let Some(msg) = pending.pop_front() {
+            msg
+        } else {
+            let Some(line) = lines.next_line().await? else {
+                break;
+            };
+            if line.trim().is_empty() {
+                continue;
+            }
+            let Ok(msg) = serde_json::from_str::<Value>(&line) else {
+                write_json_line(
+                    &mut stdout,
+                    &jsonrpc_error(&Value::Null, -32700, "Parse error", None),
+                )
+                .await?;
+                continue;
+            };
+            msg
         };
-
+        let method = msg.get("method").and_then(Value::as_str);
+        if method.is_none()
+            && msg["id"]
+                .as_str()
+                .is_some_and(|id| id.starts_with("ov-agy-roots-"))
+        {
+            continue; // A response that arrived after our roots deadline.
+        }
+        match method {
+            Some("server/discover") => {
+                roots_supported = msg["params"]["_meta"]
+                    ["io.modelcontextprotocol/clientCapabilities"]["roots"]
+                    .is_object();
+                refresh_roots = roots_supported;
+            }
+            Some("initialize") => {
+                roots_supported = msg["params"]["capabilities"]["roots"].is_object();
+                refresh_roots = roots_supported;
+            }
+            Some("notifications/roots/list_changed") => {
+                refresh_roots = roots_supported;
+                continue;
+            }
+            _ => {}
+        }
+        // Older clients can serve roots only after initialize has returned.
+        if refresh_roots && !matches!(method, Some("initialize" | "notifications/initialized")) {
+            roots_seq += 1;
+            let workspace =
+                request_workspace(&mut lines, &mut stdout, &mut pending, roots_seq).await?;
+            let cfg = workspace_config(workspace.as_deref());
+            let previous = &state.cfg;
+            let reconnect = state.session_id.is_some()
+                && (cfg.peer_id != previous.peer_id
+                    || cfg.mcp_url != previous.mcp_url
+                    || cfg.account != previous.account
+                    || cfg.user != previous.user
+                    || cfg.api_key != previous.api_key);
+            if reconnect {
+                delete_mcp_session(&mut state).await;
+            }
+            state.cfg = cfg;
+            if reconnect {
+                reinitialize_session(&mut state).await?;
+            }
+            refresh_roots = false;
+        }
         handle_client_message(&mut state, msg, &mut stdout).await?;
     }
 
     delete_mcp_session(&mut state).await;
     let _ = stdout.flush().await;
     Ok(())
+}
+
+/// Installed plugins start in `PLUGIN_ROOT`. Without a host root, use personal
+/// configuration only. A standalone invocation still inherits its caller's cwd.
+fn workspace_config(workspace: Option<&Path>) -> ResolvedConfig {
+    let neutral = std::env::var_os("PLUGIN_ROOT").and_then(|_| dirs::home_dir());
+    ResolvedConfig::load(workspace.or(neutral.as_deref()))
+}
+
+async fn request_workspace<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin>(
+    lines: &mut tokio::io::Lines<R>,
+    stdout: &mut W,
+    pending: &mut VecDeque<Value>,
+    seq: u64,
+) -> Result<Option<PathBuf>> {
+    let id = format!("ov-agy-roots-{seq}");
+    write_json_line(
+        stdout,
+        &json!({"jsonrpc":"2.0","id":id,"method":"roots/list"}),
+    )
+    .await?;
+    let reply = async {
+        while let Some(line) = lines.next_line().await? {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let Ok(msg) = serde_json::from_str::<Value>(&line) else {
+                write_json_line(
+                    stdout,
+                    &jsonrpc_error(&Value::Null, -32700, "Parse error", None),
+                )
+                .await?;
+                continue;
+            };
+            if msg.get("method").is_none() && msg["id"] == id {
+                let path = msg["result"]["roots"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .find_map(|root| {
+                        url::Url::parse(root["uri"].as_str()?)
+                            .ok()?
+                            .to_file_path()
+                            .ok()
+                    });
+                return Ok(path);
+            }
+            pending.push_back(msg);
+        }
+        Ok(None)
+    };
+    tokio::time::timeout(Duration::from_secs(2), reply)
+        .await
+        .unwrap_or(Ok(None))
 }
 
 #[derive(Debug, Clone)]

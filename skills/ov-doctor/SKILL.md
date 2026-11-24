@@ -31,7 +31,7 @@ The diagnostic report verifies:
 3. **`/health` Reachability & Latency**: Measures round-trip latency and checks server `version` and `auth_mode`.
 4. **`/mcp` Streamable HTTP Handshake**: Sends an MCP `initialize` probe to verify `200 OK`, session establishment (`mcp-session-id`), and absence of `401`/`403` gateway rejections.
 5. **Git `peer` Identity**: Confirms worktree-aware repository `peer` normalization across main checkouts and linked Git worktrees.
-6. **Offline Capture WAL**: Reports pending queued entries and byte size in `wal/pending.jsonl`.
+6. **Offline Capture WAL**: Reports pending queued entries and byte size in the active `wal/<scope>/pending.jsonl` queue.
 
 ## Step 2: Remediation Guide
 
@@ -43,7 +43,7 @@ The diagnostic report verifies:
 - **`/health` Unreachable**:
   - Verify `openviking-server` is running on the configured URL (default `http://127.0.0.1:1933`) and check firewall/proxy settings.
 - **Pending Offline WAL Entries (`pending_wal_entries > 0`)**:
-  - Once `/health` and credentials are healthy, the next `Stop` capture worker automatically replays and drains `wal/pending.jsonl`.
+  - Once `/health` and credentials are healthy, the next `Stop` capture worker replays the queue for the matching URL, account, user, API key and peer. A rotated key selects a new queue. The old unscoped `wal/pending.jsonl` requires manual verification of its original destination before recovery.
 
 ## Safety Rules
 

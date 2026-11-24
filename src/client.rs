@@ -160,9 +160,10 @@ impl OvClient {
     }
 
     /// Lists skill packages under `uri` (e.g. `viking://~/skills` or `viking://agent/skills`).
-    pub async fn list_skills(
+    pub async fn list_entries(
         &self,
         uri: &str,
+        recursive: bool,
         timeout: Duration,
     ) -> Result<Vec<OvFsEntry>, ClientError> {
         let mut endpoint = Url::parse(&format!("{}/api/v1/fs/ls", self.cfg.base_url))
@@ -170,6 +171,7 @@ impl OvClient {
         endpoint
             .query_pairs_mut()
             .append_pair("uri", uri)
+            .append_pair("recursive", if recursive { "true" } else { "false" })
             .append_pair("include_abstract", "true")
             .append_pair("limit", "30");
 
@@ -188,6 +190,50 @@ impl OvClient {
         let env: OvEnvelope<Vec<OvFsEntry>> = serde_json::from_str(&text)
             .map_err(|err| ClientError::InvalidJson(format!("{err}: {text}")))?;
         Ok(env.result.unwrap_or_default())
+    }
+
+    /// Reads the text of a startup profile when available.
+    pub async fn read_profile(&self, uri: &str, timeout: Duration) -> Option<String> {
+        let env = self
+            .http
+            .get(format!("{}/api/v1/content/read", self.cfg.base_url))
+            .headers(self.default_headers())
+            .query(&[("uri", uri)])
+            .timeout(timeout)
+            .send()
+            .await
+            .ok()?
+            .error_for_status()
+            .ok()?
+            .json::<OvEnvelope<String>>()
+            .await
+            .ok()?;
+        env.result
+    }
+
+    pub async fn latest_archive(&self, session: &str, timeout: Duration) -> Option<String> {
+        let path = urlencoding_segment(session);
+        let env = self
+            .http
+            .get(format!(
+                "{}/api/v1/sessions/{path}/context",
+                self.cfg.base_url
+            ))
+            .headers(self.default_headers())
+            .query(&[("token_budget", "1000")])
+            .timeout(timeout)
+            .send()
+            .await
+            .ok()?
+            .error_for_status()
+            .ok()?
+            .json::<OvEnvelope<Value>>()
+            .await
+            .ok()?;
+        env.result?
+            .get("latest_archive_overview")?
+            .as_str()
+            .map(str::to_owned)
     }
 
     /// Performs context-assembled search via `POST /api/v1/search/search` (`mode: "context"`).
@@ -214,7 +260,10 @@ impl OvClient {
                 Some(session_id.to_string())
             },
             dedup_turns: Some(self.cfg.recall_dedup_turns),
-            limit: Some(self.cfg.recall_limit),
+            purpose: "coding",
+            quotas: self.cfg.explicit_recall_limit.map(coding_quotas),
+            max_tokens: self.cfg.recall_max_tokens,
+            rewrite: self.cfg.recall_rewrite.clone(),
             score_threshold: Some(self.cfg.score_threshold),
             peer_scope: if self.cfg.recall_peer_scope == "actor" {
                 Some("actor".to_string())
@@ -239,7 +288,9 @@ impl OvClient {
         if !status.is_success() {
             let err = parse_http_error(status.as_u16(), &text);
             let lower = text.to_ascii_lowercase();
-            if matches!(status.as_u16(), 400 | 422)
+            if self.cfg.recall_peer_scope != "actor"
+                && self.cfg.recall_exclude_uris.is_empty()
+                && matches!(status.as_u16(), 400 | 422)
                 && (lower.contains("mode") || lower.contains("extra"))
             {
                 return self.fallback_find(query, timeout).await;
@@ -274,11 +325,8 @@ impl OvClient {
         query: &str,
         timeout: Duration,
     ) -> Result<Option<String>, ClientError> {
-        let targets = ["viking://~/memories", "viking://~/skills"];
         let url = format!("{}/api/v1/search/find", self.cfg.base_url);
-        let mut combined = Vec::new();
-
-        for target in targets {
+        let find = async |target: &str| -> Result<Vec<OvMatchedItem>, ClientError> {
             let body = OvFindRequest {
                 query: query.to_string(),
                 target_uri: target.to_string(),
@@ -292,23 +340,27 @@ impl OvClient {
                 .timeout(timeout)
                 .json(&body)
                 .send()
-                .await?;
-            if !resp.status().is_success() {
-                continue;
+                .await?
+                .error_for_status()?;
+            let env = resp.json::<OvEnvelope<OvSearchResult>>().await?;
+            let result = env.result.unwrap_or_default();
+            let mut items = result.memories;
+            items.extend(result.resources);
+            items.extend(result.skills);
+            Ok(items)
+        };
+        let (memories, skills) =
+            tokio::join!(find("viking://~/memories"), find("viking://~/skills"));
+        let mut items = match (memories, skills) {
+            (Err(err), Err(_)) => return Err(err),
+            (Ok(items), Err(_)) | (Err(_), Ok(items)) => items,
+            (Ok(mut items), Ok(skills)) => {
+                items.extend(skills);
+                items
             }
-            if let Ok(env) = resp.json::<OvEnvelope<OvSearchResult>>().await {
-                if let Some(res) = env.result {
-                    combined.extend(res.memories);
-                    combined.extend(res.resources);
-                    combined.extend(res.skills);
-                }
-            }
-        }
-
-        if combined.is_empty() {
-            return Ok(None);
-        }
-        Ok(format_matched_items(&combined))
+        };
+        items.truncate(self.cfg.recall_limit);
+        Ok(format_matched_items(&items))
     }
 
     /// Appends a message to `POST /api/v1/sessions/{session_id}/messages`,
@@ -526,6 +578,36 @@ pub fn build_ov_headers(cfg: &ResolvedConfig) -> HeaderMap {
     }
 
     headers
+}
+
+fn coding_quotas(limit: usize) -> Value {
+    // Match the coding preset and its one-slot floor for each source.
+    let weights = [
+        ("events", 1),
+        ("entities", 2),
+        ("preferences", 1),
+        ("experiences", 1),
+        ("resources", 3),
+        ("skills", 2),
+    ];
+    let mut counts = [1_i64; 6];
+    let slots = i64::try_from(limit).unwrap_or(50);
+    for _ in weights.len()..limit {
+        let mut best = 0;
+        for i in 1..weights.len() {
+            if slots * weights[i].1 - counts[i] * 10 > slots * weights[best].1 - counts[best] * 10 {
+                best = i;
+            }
+        }
+        counts[best] += 1;
+    }
+    Value::Object(
+        weights
+            .into_iter()
+            .zip(counts)
+            .map(|((key, _), n)| (key.to_owned(), Value::from(n)))
+            .collect(),
+    )
 }
 
 fn render_search_result(res: &OvSearchResult) -> Option<String> {

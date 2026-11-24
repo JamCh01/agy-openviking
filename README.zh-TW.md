@@ -34,22 +34,24 @@
 `agy-openviking`（`ov-agy`）以**零 Node.js / Python 執行環境依賴**的單一 Rust 原生執行檔，將 OpenViking 完整整合至 Google Antigravity CLI（`agy`）的五大擴充支柱（**MCP 伺服器 + 生命週期掛鉤 + 非同步子代理 + 技能套件 + 常駐規則**）：
 
 - **亞毫秒級同步熱路徑與安全放行（Fail-Open）**：高頻率的生命週期掛鉤（`PreToolUse` 與 `Stop`）採用零非同步執行期開銷的同步路徑（`< 1 ms`）；所有掛鉤皆會攔截網路逾時與設定異常，並以結束代碼 `0` 回傳合法的保底 JSON，確保 OpenViking 離線時絕不卡住 `agy` 主程序。
-- **保護 Prompt 快取的輪次去重機制**：`PreInvocation` 僅從尾部讀取 `transcript.jsonl` 末端 `64 KiB`，對 `(conversationId, turn_offset, query)` 計算雜湊值，確保每個使用者提問輪次僅發送一次 `mode: "context"` 檢索；同一輪次內的工具呼叫迴圈（`invocationNum > 1`）直接以零網路開銷回傳 `{}`，避免破壞大型語言模型的前綴快取（Prompt Cache）。
+- **依使用者輪次去重。** 首次模型呼叫依當前提問和對話步驟檢索。工具迴圈（`invocationNum > 0`）和模型回覆後的背景喚醒會跳過檢索。
 - **Git Worktree 儲存庫層級 Peer 正規化**：自動解析連結式 Git 工作樹（`.git` 檔案內的 `gitdir:` 與 `commondir`）回溯共用的 `.git/config`，將 SSH（`git@github.com:Org/Repo.git`）與 HTTPS（`https://github.com/Org/Repo.git`）遠端網址正規化為相同的儲存庫 `peer` 識別碼。
-- **防記憶自我污染擷取與離線預寫式日誌（WAL）**：背景獨立程序 `ov-agy worker` 在寫入對話紀錄前會自動清除 `<openviking-context>`、`<openviking-session>` 與 `<available-skills>` 注入區塊；當伺服器無法連線時，透過 `fs4` 檔案鎖定將待傳送資料寫入離線佇列 `wal/pending.jsonl`（上限 `10 MiB`），待連線恢復後自動重播。
+- **防記憶自我污染擷取與離線預寫式日誌（WAL）**：背景獨立程序 `ov-agy worker` 在寫入對話紀錄前會自動清除 `<openviking-context>`、`<openviking-session>` 與 `<available-skills>` 注入區塊；當伺服器無法連線時，透過 `fs4` 檔案鎖定將待傳送資料寫入離線佇列 `wal/<scope>/pending.jsonl`（上限 `10 MiB`），待連線恢復後自動重播。
 
 ## 核心架構與元件
 
 | 元件 | 進入點 / 檔案路徑 | 職責邊界 |
 | :--- | :--- | :--- |
-| **MCP 代理（`mcp-proxy`）** | `ov-agy mcp-proxy`（`mcp_config.json`） | 將標準輸入輸出 JSON-RPC 2.0 橋接至 Streamable HTTP `POST {base_url}/mcp`，支援 `application/json` 與 `text/event-stream`（SSE）串流回應，並在遇到 HTTP `404` 工作階段失效時自動重新交握恢復 `mcp-session-id`。 |
-| **`SessionStart` 生命週期掛鉤** | `./scripts/ov-agy hook session-start` | 對談啟動時探測 `/health` 與 `/api/v1/system/status`，探索 `viking://~/skills` 與 `viking://agent/skills` 遠端技能摘要，一次性注入工作階段狀態。 |
-| **`PreInvocation` 生命週期掛鉤** | `./scripts/ov-agy hook pre-invocation` | 從 `transcript.jsonl` 尾端擷取最新使用者輸入，完成輪次去重後呼叫 `POST /api/v1/search/search`（`mode: "context"`）注入 `<openviking-context>`。 |
-| **`PreToolUse` 生命週期掛鉤** | `./scripts/ov-agy hook pre-tool` | `< 1 ms` 同步安全閘門，攔截任何誤將 `viking://` 虛擬 URI 傳入本機檔案工具（`view_file`、`write_to_file`、`replace_file_content`、`multi_replace_file_content`、`list_dir`、`grep_search`）的呼叫。 |
-| **`Stop` 掛鉤與背景 `worker`** | `./scripts/ov-agy hook stop` -> `ov-agy worker` | 當 `fullyIdle == true` 時以分離模式（`Stdio::null()`）啟動背景 `ov-agy worker`；清理注入標籤後寫入 `agy-{conversationId}` 工作階段、依輪次門檻觸發 `/commit`，並於斷線時讀寫離線 `wal/pending.jsonl`。 |
+| **MCP 代理（`mcp-proxy`）** | `ov-agy mcp-proxy`（`mcp_config.json`） | 透過 MCP `roots/list` 取得 agy 工作區，將 JSON/SSE 請求轉送至 `{base_url}/mcp`。有狀態的工作階段過期回傳 HTTP 404 時重新交握。 |
+| **`SessionStart` 生命週期掛鉤** | `./scripts/ov-agy hook session-start` | 檢查連線，注入使用者與專案設定檔、偏好和實體索引、技能清單，以及目前工作階段已有的封存摘要。 |
+| **`PreInvocation` 生命週期掛鉤** | `./scripts/ov-agy hook pre-invocation` | 使用 `lastUserInput` 和對話紀錄辨識當前輪次，優先讀取 `transcript_full.jsonl`，按程式開發情境檢索。 |
+| **`PreToolUse` 生命週期掛鉤** | `./scripts/ov-agy hook pre-tool` | 攔截路徑以 `viking://` 起始的本機檔案操作。檔案內文與搜尋條件可以引用此 URI。 |
+| **`Stop` 掛鉤與背景 `worker`** | `./scripts/ov-agy hook stop` -> `ov-agy worker` | 閒置時將已完成的訊息寫入 `agy-{conversationId}`，提交剩餘批次，並重播目前身分的離線佇列。 |
 | **非同步子代理（Subagent）** | `agents/viking-navigator.md` | 唯讀背景檢索子代理（`inheritMcp: true`，`commandExecutionPolicy: off`），依循 L0 -> L1 -> L2 漸進探索 `viking://` 知識樹並回傳附帶精確 URI 引用的摘要，避免撐爆主對話視窗。 |
 | **四大技能（`/ov-*`）** | `skills/*/SKILL.md` | `/ov-doctor`（連線與離線佇列診斷）、`/ov-ingest`（外部文件/儲存庫與技能匯入標準程序）、`/ov-experience`（保留遙測歸因的除錯經驗檢索）、`/ov-rule-search`（修改程式碼前的編譯態架構規範檢索）。 |
 | **常駐規則（Rules）** | `rules/openviking-context.md` | 頂部明確設定 `trigger: always_on`，強制遵守 `viking://` 虛擬路徑邊界、`viking://~` 家目錄別名定址、L0 -> L1 -> L2 漸進式檢索與本機工作區程式碼優先原則。 |
+
+在 agy 1.5.16 中，ACP 的 `session/load` 會還原對話紀錄，且不會再次觸發 `SessionStart`。下次提問仍會進行語意檢索，擷取則從上次儲存的位置繼續。
 
 ```mermaid
 flowchart LR
@@ -57,7 +59,7 @@ flowchart LR
     HOOKS["生命週期掛鉤\n(session-start / pre-invocation / pre-tool / stop)"]
     MCP["ov-agy mcp-proxy\n(stdio <-> Streamable HTTP)"]
     WORKER["獨立背景程序 ov-agy worker"]
-    WAL[("離線預寫式日誌 WAL\nwal/pending.jsonl")]
+    WAL[("離線預寫式日誌 WAL\nwal/{scope}/pending.jsonl")]
     OV["OpenViking 伺服器\n(/health, /api/v1/*, /mcp)"]
 
     AGY -->|"stdin/stdout JSON"| HOOKS
@@ -89,7 +91,7 @@ agy plugin install https://github.com/JamCh01/agy-openviking
 在受限企業內網或連線 GitHub Releases 較慢的環境中，可透過環境變數 `OPENVIKING_RELEASE_BASE_URL` 覆寫下載前綴（鏡像路徑下放置對應版本的壓縮檔與 `checksums.txt`）：
 
 ```bash
-export OPENVIKING_RELEASE_BASE_URL="https://mirror.example.com/JamCh01/agy-openviking/releases/download/v0.1.1"
+export OPENVIKING_RELEASE_BASE_URL="https://mirror.example.com/JamCh01/agy-openviking/releases/download/v0.1.2"
 ```
 
 ### 從原始碼本機建置開發
@@ -150,6 +152,8 @@ agy plugin install .
 5. **OpenViking 伺服器設定檔**：`~/.openviking/ov.conf`（或 `OPENVIKING_CONFIG_FILE`，支援 `server.*` 與 `antigravity.*`）
 6. **內建預設值**：`http://127.0.0.1:1933`（若未偵測到任何設定檔且未設定 `OPENVIKING_MEMORY_ENABLED`，外掛將自動維持靜默停用，零額外資源消耗）。
 
+工作區檔案可設定 peer 和外掛行為。伺服器位址、API 金鑰、帳號與使用者由個人設定或環境變數提供。離線佇列依上述連線資訊及 peer 隔離，舊版 `wal/pending.jsonl` 保留供手動復原。
+
 ### 環境變數完整參考表
 
 | 環境變數 | 預設值 | 說明 |
@@ -165,11 +169,14 @@ agy plugin install .
 | `OPENVIKING_HOME` | `~/.openviking` | OpenViking 設定檔與日誌根目錄。 |
 | `OPENVIKING_CLI_CONFIG_FILE` | `~/.openviking/ovcli.conf` | 自訂 `ovcli.conf` 設定檔路徑。 |
 | `OPENVIKING_CONFIG_FILE` | `~/.openviking/ov.conf` | 自訂 `ov.conf` 設定檔路徑。 |
-| `OPENVIKING_PLUGIN_DATA` / `OPENVIKING_STATE_DIR` | `~/.openviking/agy-plugin` | 儲存工作階段狀態、檔案鎖定、離線 `wal/pending.jsonl` 與快取執行檔的資料目錄。 |
+| `OPENVIKING_PLUGIN_DATA` / `OPENVIKING_STATE_DIR` | `~/.openviking/agy-plugin` | 儲存工作階段狀態、檔案鎖定、離線 `wal/<scope>/pending.jsonl` 與快取執行檔的資料目錄。 |
 | `OPENVIKING_TIMEOUT_MS` | `15000` | HTTP 請求逾時毫秒數（範圍 `500`–`300000`）。 |
 | `OPENVIKING_AUTO_RECALL` | `true` | 是否於 `PreInvocation` 階段啟用自動脈絡記憶檢索。 |
 | `OPENVIKING_AUTO_CAPTURE` | `true` | 是否於 `Stop` 階段啟用背景對話擷取與自動提交。 |
-| `OPENVIKING_RECALL_LIMIT` | `6` | 單輪檢索回傳的最大脈絡筆數（範圍 `1`–`50`）。 |
+| `OPENVIKING_RECALL_LIMIT` | 伺服器預設 | 明確設定後，依權重分配給六類來源，每類至少一項（範圍 1–50）。舊版 find 預設取 6 項。 |
+| `OPENVIKING_RECALL_MAX_TOKENS` | 伺服器預設 | 脈絡檢索的 token 預算（64–32000）。 |
+| `OPENVIKING_RECALL_REWRITE` | 關閉 | 設為 `server` 或 `auto` 啟用伺服器端改寫，受掛鉤逾時限制。 |
+| `OPENVIKING_NO_AUTO_INJECT` | `false` | 略過啟動設定檔、索引及技能清單。封存摘要與逐輪檢索仍可使用。 |
 | `OPENVIKING_RECALL_DEDUP_TURNS` | `5` | 伺服器端跨輪次去重視窗大小（範圍 `0`–`20`）。 |
 | `OPENVIKING_SCORE_THRESHOLD` | `0.35` | 檢索結果最低相關性分數門檻（範圍 `0.0`–`1.0`）。 |
 | `OPENVIKING_MIN_QUERY_LENGTH` | `3` | 觸發記憶檢索的最短使用者提問字元數（範圍 `1`–`64`）。 |
@@ -178,7 +185,7 @@ agy plugin install .
 | `OPENVIKING_RECALL_QUERY_FILTERS` | *(空)* | 檢索前套用至查詢字串的 `sed` 風格（`s/pat/rep/g`、`d/pat/`、`k/pat/`）或正規表示式過濾規則。 |
 | `OPENVIKING_CAPTURE_FILTERS` | *(空)* | 擷取前遮罩或丟棄訊息的過濾規則（支援 `user:` / `assistant:` 角色前綴）。 |
 | `OPENVIKING_CAPTURE_MAX_LENGTH` | `24000` | 單則擷取訊息的最大字元數上限（範圍 `200`–`100000`）。 |
-| `OPENVIKING_COMMIT_EVERY_TURNS` | `6` | 觸發 `POST /api/v1/sessions/{id}/commit` 的未提交輪次門檻（範圍 `1`–`1000`）。 |
+| `OPENVIKING_COMMIT_EVERY_TURNS` | `6` | 每批擷取訊息的提交間隔（1–1000）。工作階段閒置時也會提交剩餘訊息。 |
 | `OPENVIKING_DEBUG` | `false` | 啟用後將結構化診斷事件寫入 `OPENVIKING_DEBUG_LOG`（絕不污染 `stdout`）。 |
 | `OPENVIKING_DEBUG_LOG` | `~/.openviking/logs/agy.jsonl` | 啟用除錯模式時的 JSONL 診斷日誌路徑。 |
 | `OPENVIKING_RELEASE_BASE_URL` | GitHub Releases 網址 | `scripts/fetch-binary.sh` 下載預編譯執行檔時的自訂鏡像網址前綴。 |
