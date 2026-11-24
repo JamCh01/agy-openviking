@@ -11,6 +11,9 @@ PLUGIN_ROOT_RESOLVED=${PLUGIN_ROOT:-$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)}
 VERSION="${1:-}"
 if [ -z "$VERSION" ]; then
     MANIFEST_FILE="$PLUGIN_ROOT_RESOLVED/.antigravity-plugin/plugin.json"
+    if [ ! -f "$MANIFEST_FILE" ]; then
+        MANIFEST_FILE="$PLUGIN_ROOT_RESOLVED/plugin.json"
+    fi
     if [ -f "$MANIFEST_FILE" ]; then
         VERSION=$(tr -d '\r' < "$MANIFEST_FILE" | awk -F'"' '
             {

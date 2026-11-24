@@ -1756,6 +1756,84 @@ async fn test_8_cold_start_concurrent_fetch_and_sha256_guard() {
         "no temporary staging files (.ov-agy.tmp.*) may remain after atomic mv -f"
     );
 
+    // 5b. Verify Marketplace bundle layout where .antigravity-plugin/plugin.json is promoted
+    //     to root plugin.json (with no .antigravity-plugin/ directory).
+    let promoted_root = temp_dir.path().join("plugin-root-promoted");
+    let promoted_scripts = promoted_root.join("scripts");
+    fs::create_dir_all(&promoted_scripts).expect("promoted scripts dir must create");
+    fs::write(
+        promoted_root.join("plugin.json"),
+        serde_json::to_string_pretty(&json!({
+            "name": "openviking",
+            "version": "9.8.7",
+            "description": "Promoted root plugin.json layout for Marketplace bundles"
+        }))
+        .expect("promoted plugin.json must serialize"),
+    )
+    .expect("promoted root plugin.json must write");
+    for script_name in ["ov-agy", "fetch-binary.sh"] {
+        let src = manifest_dir.join("scripts").join(script_name);
+        let dst = promoted_scripts.join(script_name);
+        fs::copy(&src, &dst).expect("promoted script must copy");
+        let mut perms = fs::metadata(&dst)
+            .expect("promoted script metadata must read")
+            .permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&dst, perms).expect("promoted script must be chmod 0755");
+    }
+
+    let promoted_data = temp_dir.path().join("plugin-data-promoted");
+    let promoted_scripts_run = promoted_scripts.clone();
+    let promoted_root_run = promoted_root.clone();
+    let promoted_data_run = promoted_data.clone();
+    let promoted_url = release_base_url.clone();
+    let promoted_home = home_dir.clone();
+    let promoted_out = task::spawn_blocking(move || {
+        Command::new(promoted_scripts_run.join("ov-agy"))
+            .arg("--version")
+            .env("PLUGIN_ROOT", &promoted_root_run)
+            .env("OPENVIKING_PLUGIN_DATA", &promoted_data_run)
+            .env("OPENVIKING_RELEASE_BASE_URL", &promoted_url)
+            .env("NO_PROXY", "127.0.0.1,localhost")
+            .env("no_proxy", "127.0.0.1,localhost")
+            .env("HOME", &promoted_home)
+            .output()
+            .expect("promoted root plugin.json cold start must execute")
+    })
+    .await
+    .expect("promoted cold-start blocking task must join");
+    assert!(
+        promoted_out.status.success(),
+        "promoted root plugin.json cold start failed: stderr={}",
+        String::from_utf8_lossy(&promoted_out.stderr)
+    );
+    assert!(
+        promoted_data.join("bin").join("ov-agy-v9.8.7").is_file(),
+        "promoted root plugin.json must resolve version 9.8.7 and install binary"
+    );
+
+    let direct_fetch_data = temp_dir.path().join("plugin-data-direct-fetch");
+    let direct_url = release_base_url.clone();
+    let direct_home = home_dir.clone();
+    let direct_fetch_out = task::spawn_blocking(move || {
+        Command::new(promoted_scripts.join("fetch-binary.sh"))
+            .env("PLUGIN_ROOT", &promoted_root)
+            .env("OPENVIKING_PLUGIN_DATA", &direct_fetch_data)
+            .env("OPENVIKING_RELEASE_BASE_URL", &direct_url)
+            .env("NO_PROXY", "127.0.0.1,localhost")
+            .env("no_proxy", "127.0.0.1,localhost")
+            .env("HOME", &direct_home)
+            .output()
+            .expect("direct fetch-binary.sh fallback must execute")
+    })
+    .await
+    .expect("direct fetch-binary.sh task must join");
+    assert!(
+        direct_fetch_out.status.success(),
+        "fetch-binary.sh root plugin.json fallback failed: stderr={}",
+        String::from_utf8_lossy(&direct_fetch_out.stderr)
+    );
+
     // 6. Verify SHA-256 mismatch aborts before placing any binary.
     *checksums_shared
         .lock()

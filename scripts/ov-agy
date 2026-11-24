@@ -17,7 +17,10 @@ done
 
 MANIFEST_FILE="$PLUGIN_ROOT_RESOLVED/.antigravity-plugin/plugin.json"
 if [ ! -f "$MANIFEST_FILE" ]; then
-    echo "[ov-agy] Missing plugin manifest at $MANIFEST_FILE" >&2
+    MANIFEST_FILE="$PLUGIN_ROOT_RESOLVED/plugin.json"
+fi
+if [ ! -f "$MANIFEST_FILE" ]; then
+    echo "[ov-agy] Missing plugin manifest at $PLUGIN_ROOT_RESOLVED/.antigravity-plugin/plugin.json or $PLUGIN_ROOT_RESOLVED/plugin.json" >&2
     exit 1
 fi
 
