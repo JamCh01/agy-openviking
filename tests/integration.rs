@@ -1794,3 +1794,311 @@ async fn test_8_cold_start_concurrent_fetch_and_sha256_guard() {
 
     release_handle.abort();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_9_review_regressions_hooks_mcp_and_auth_wal() {
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let hooks_raw =
+        fs::read_to_string(manifest_dir.join("hooks.json")).expect("hooks.json must be readable");
+    for required_tool in [
+        "view_file",
+        "read_file",
+        "write_to_file",
+        "write_file",
+        "replace_file_content",
+        "multi_replace_file_content",
+        "edit_file",
+        "list_dir",
+        "grep_search",
+        "find_by_name",
+    ] {
+        assert!(
+            hooks_raw.contains(required_tool),
+            "hooks.json PreToolUse matcher must cover {required_tool}"
+        );
+    }
+
+    // 1. Verify mcp-proxy never hangs on 200 OK non-JSON gateway HTML, premature SSE close,
+    //    and forwards JSON-RPC 2.0 batch arrays cleanly.
+    let mcp_router = Router::new().route(
+        "/mcp",
+        post(|body: Json<Value>| async move {
+            let payload = body.0;
+            if let Some(arr) = payload.as_array() {
+                let mut batch_replies = Vec::new();
+                for item in arr {
+                    if let Some(id) = item.get("id") {
+                        batch_replies.push(json!({
+                            "jsonrpc": "2.0",
+                            "id": id,
+                            "result": { "batch_ok": true }
+                        }));
+                    }
+                }
+                return (
+                    StatusCode::OK,
+                    [(axum::http::header::CONTENT_TYPE, "application/json")],
+                    serde_json::to_string(&batch_replies).expect("batch reply must serialize"),
+                )
+                    .into_response();
+            }
+
+            let req_id = payload.get("id").and_then(Value::as_str).unwrap_or("");
+            match req_id {
+                "html-200" => (
+                    StatusCode::OK,
+                    [(axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8")],
+                    "<html><body>SSO Login Required</body></html>".to_string(),
+                )
+                    .into_response(),
+                "sse-empty" => (
+                    StatusCode::OK,
+                    [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+                    ": keepalive\n\n".to_string(),
+                )
+                    .into_response(),
+                _ => Json(json!({
+                    "jsonrpc": "2.0",
+                    "id": payload.get("id").cloned().unwrap_or(Value::Null),
+                    "result": { "ok": true }
+                }))
+                .into_response(),
+            }
+        }),
+    );
+
+    let mcp_listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("custom mcp test listener must bind");
+    let mcp_addr = mcp_listener
+        .local_addr()
+        .expect("custom mcp test addr must resolve");
+    let mcp_handle = tokio::spawn(async move {
+        let _ = axum::serve(mcp_listener, mcp_router).await;
+    });
+
+    let temp_dir = TempDir::new().expect("regression tempdir must create");
+    let mcp_base_url = format!("http://{mcp_addr}");
+    let paths = setup_test_ovcli(temp_dir.path(), &mcp_base_url, "user-key-valid");
+
+    let home_root = temp_dir.path().to_path_buf();
+    let ov_home_path = paths.ov_home.clone();
+    let pdata_path = paths.plugin_data.clone();
+    let cliconf_path = paths.cli_conf.clone();
+
+    let proxy_lines = task::spawn_blocking(move || {
+        let mut child = Command::new(ov_agy_bin())
+            .arg("mcp-proxy")
+            .env("HOME", &home_root)
+            .env("OPENVIKING_HOME", &ov_home_path)
+            .env("OPENVIKING_PLUGIN_DATA", &pdata_path)
+            .env("OPENVIKING_CLI_CONFIG_FILE", &cliconf_path)
+            .env("NO_PROXY", "127.0.0.1,localhost")
+            .env("no_proxy", "127.0.0.1,localhost")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("mcp-proxy process must spawn");
+
+        let mut stdin = child.stdin.take().expect("mcp-proxy stdin must open");
+        let stdout = child.stdout.take().expect("mcp-proxy stdout must open");
+        let mut reader = BufReader::new(stdout);
+
+        let mut results = Vec::new();
+        for frame in [
+            r#"{"jsonrpc":"2.0","id":"html-200","method":"tools/list"}"#,
+            r#"{"jsonrpc":"2.0","id":"sse-empty","method":"tools/call"}"#,
+            r#"[{"jsonrpc":"2.0","id":"batch-1","method":"ping"}]"#,
+        ] {
+            writeln!(stdin, "{frame}").expect("request frame write must succeed");
+            stdin.flush().expect("request frame flush must succeed");
+
+            let mut reply_line = String::new();
+            reader
+                .read_line(&mut reply_line)
+                .expect("mcp-proxy must emit a response line without hanging");
+            results.push(reply_line);
+        }
+
+        drop(stdin);
+        let _ = child.wait();
+        results
+    })
+    .await
+    .expect("mcp-proxy blocking task must join");
+
+    let html_err: Value = serde_json::from_str(proxy_lines[0].trim())
+        .expect("HTML 200 fallback must be valid JSON-RPC");
+    assert_eq!(
+        html_err.get("id").and_then(Value::as_str),
+        Some("html-200"),
+        "HTML 200 error frame must preserve request id"
+    );
+    assert!(
+        html_err.get("error").is_some(),
+        "HTML 200 response must translate into a JSON-RPC error object"
+    );
+
+    let sse_err: Value = serde_json::from_str(proxy_lines[1].trim())
+        .expect("empty SSE stream fallback must be valid JSON-RPC");
+    assert_eq!(
+        sse_err.get("id").and_then(Value::as_str),
+        Some("sse-empty"),
+        "empty SSE error frame must preserve request id"
+    );
+    assert!(
+        sse_err.get("error").is_some(),
+        "premature SSE close must emit a JSON-RPC error object"
+    );
+
+    let batch_ok: Value = serde_json::from_str(proxy_lines[2].trim())
+        .expect("batch JSON-RPC reply must parse as JSON");
+    assert!(
+        batch_ok.is_array(),
+        "JSON-RPC batch array must receive batch array response, got: {batch_ok}"
+    );
+
+    mcp_handle.abort();
+
+    // 2. Verify HTTP 403 Forbidden during worker capture preserves turns in offline WAL
+    //    and replays cleanly once credentials are fixed.
+    let reject_403 = Arc::new(AtomicBool::new(true));
+    let saved_msgs: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
+
+    let flag_403 = Arc::clone(&reject_403);
+    let saved_clone = Arc::clone(&saved_msgs);
+    let capture_router = Router::new()
+        .route(
+            "/api/v1/sessions/{session_id}/messages",
+            post(move |body: Json<Value>| {
+                let flag = Arc::clone(&flag_403);
+                let store = Arc::clone(&saved_clone);
+                async move {
+                    if flag.load(Ordering::SeqCst) {
+                        (
+                            StatusCode::FORBIDDEN,
+                            Json(json!({
+                                "status": "error",
+                                "error": { "code": "FORBIDDEN", "message": "Root key forbidden" }
+                            })),
+                        )
+                            .into_response()
+                    } else {
+                        store
+                            .lock()
+                            .expect("saved_msgs mutex should not be poisoned")
+                            .push(body.0);
+                        Json(json!({ "status": "ok", "result": {} })).into_response()
+                    }
+                }
+            }),
+        )
+        .route(
+            "/api/v1/sessions/{session_id}/commit",
+            post(|| async { Json(json!({ "status": "ok", "result": {} })) }),
+        );
+
+    let cap_listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("capture test listener must bind");
+    let cap_addr = cap_listener
+        .local_addr()
+        .expect("capture test addr must resolve");
+    let cap_handle = tokio::spawn(async move {
+        let _ = axum::serve(cap_listener, capture_router).await;
+    });
+
+    let auth_temp = TempDir::new().expect("auth wal tempdir must create");
+    let cap_paths = setup_test_ovcli(
+        auth_temp.path(),
+        &format!("http://{cap_addr}"),
+        "bad-root-key",
+    );
+    let transcript_file = auth_temp.path().join("transcript.jsonl");
+    fs::write(
+        &transcript_file,
+        r#"{"step_index":1,"source":"USER_EXPLICIT","type":"USER_INPUT","content":"Important decision while key is 403"}
+"#,
+    )
+    .expect("transcript should write");
+
+    let run_worker_once =
+        |root: PathBuf, ovh: PathBuf, pdata: PathBuf, clic: PathBuf, tp: PathBuf| {
+            task::spawn_blocking(move || {
+                Command::new(ov_agy_bin())
+                    .args([
+                        "worker",
+                        "--conversation-id",
+                        "conv-auth-403",
+                        "--transcript-path",
+                        tp.to_str().expect("transcript path must be UTF-8"),
+                    ])
+                    .env("HOME", &root)
+                    .env("OPENVIKING_HOME", &ovh)
+                    .env("OPENVIKING_PLUGIN_DATA", &pdata)
+                    .env("OPENVIKING_CLI_CONFIG_FILE", &clic)
+                    .env("NO_PROXY", "127.0.0.1,localhost")
+                    .env("no_proxy", "127.0.0.1,localhost")
+                    .status()
+                    .expect("worker command must execute")
+            })
+        };
+
+    let status_first = run_worker_once(
+        auth_temp.path().to_path_buf(),
+        cap_paths.ov_home.clone(),
+        cap_paths.plugin_data.clone(),
+        cap_paths.cli_conf.clone(),
+        transcript_file.clone(),
+    )
+    .await
+    .expect("first worker task must join");
+    assert!(status_first.success(), "worker on 403 must exit 0");
+
+    let wal_file = cap_paths.plugin_data.join("wal").join("pending.jsonl");
+    assert!(
+        wal_file.is_file(),
+        "HTTP 403 during capture must preserve turn in wal/pending.jsonl"
+    );
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let wal_mode = fs::metadata(&wal_file)
+            .expect("wal file metadata must read")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(wal_mode, 0o600, "wal/pending.jsonl must have 0600 mode");
+    }
+
+    reject_403.store(false, Ordering::SeqCst);
+    let status_second = run_worker_once(
+        auth_temp.path().to_path_buf(),
+        cap_paths.ov_home.clone(),
+        cap_paths.plugin_data.clone(),
+        cap_paths.cli_conf.clone(),
+        transcript_file,
+    )
+    .await
+    .expect("second worker task must join");
+    assert!(
+        status_second.success(),
+        "worker replay after 403 fix must exit 0"
+    );
+    assert!(
+        !wal_file.exists(),
+        "wal/pending.jsonl must be drained and removed once credentials succeed"
+    );
+    assert_eq!(
+        saved_msgs
+            .lock()
+            .expect("saved_msgs mutex should not be poisoned")
+            .len(),
+        1,
+        "queued 403 turn must be replayed exactly once"
+    );
+
+    cap_handle.abort();
+}
