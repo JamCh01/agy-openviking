@@ -56,7 +56,50 @@ case "$(uname -s 2>/dev/null || echo unknown)" in
 esac
 CACHED_BIN="$DATA_DIR/bin/ov-agy-v${VERSION}${BIN_EXT}"
 
+# Outside agy (for example /ov-doctor run from the model's shell) PLUGIN_DATA is unset. Reuse the
+# binary the hooks already cached for this version instead of downloading a second copy.
+if [ ! -x "$CACHED_BIN" ] && [ -z "${OPENVIKING_PLUGIN_DATA:-}" ] && [ -z "${PLUGIN_DATA:-}" ]; then
+    plugin_dir_name=$(basename "$PLUGIN_ROOT_RESOLVED")
+    cached_name="ov-agy-v${VERSION}${BIN_EXT}"
+    for candidate in "$HOME"/.gemini/*/plugin_data/"$plugin_dir_name/bin/$cached_name"; do
+        if [ -x "$candidate" ]; then
+            exec "$candidate" "$@"
+        fi
+    done
+fi
+
+# Hooks run under 5-second budgets, and agy fails a tool call whose PreToolUse hook times out
+# or prints no decision. A cold start therefore answers hooks at once with a neutral result and
+# leaves the download to one background fetch; commands such as mcp-proxy and doctor wait for it.
+start_background_fetch() {
+    lock_dir="$DATA_DIR/locks/fetch-v${VERSION}.lock"
+    mkdir -p "$DATA_DIR/locks" 2>/dev/null || return 0
+    if [ -d "$lock_dir" ] && [ -n "$(find "$lock_dir" -maxdepth 0 -mmin +10 2>/dev/null)" ]; then
+        rmdir "$lock_dir" 2>/dev/null || :
+    fi
+    if mkdir "$lock_dir" 2>/dev/null; then
+        (
+            # The first exec of a new binary can stall for seconds while macOS scans it, so
+            # run it once here instead of inside the next hook's time budget.
+            if "$PLUGIN_ROOT_RESOLVED/scripts/fetch-binary.sh" "$VERSION" "$CACHED_BIN"; then
+                "$CACHED_BIN" --version || :
+            fi
+            rmdir "$lock_dir" 2>/dev/null || :
+        ) </dev/null >/dev/null 2>&1 &
+    fi
+}
+
 if [ ! -x "$CACHED_BIN" ]; then
+    if [ "${1:-}" = "hook" ]; then
+        [ -t 0 ] || cat >/dev/null 2>&1 || :
+        if [ "${2:-}" = "pre-tool" ]; then
+            printf '%s\n' '{"decision":"ask"}'
+        else
+            printf '%s\n' '{}'
+        fi
+        start_background_fetch
+        exit 0
+    fi
     "$PLUGIN_ROOT_RESOLVED/scripts/fetch-binary.sh" "$VERSION" "$CACHED_BIN" >&2
 fi
 

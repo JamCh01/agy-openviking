@@ -1,6 +1,6 @@
 [package]
 name = "ov-agy"
-version = "0.1.2"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.99.0"
 license = "Apache-2.0"
@@ -20,17 +20,22 @@ fs4 = "0.12"
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 hex = "0.4"
 regex = "1"
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
+# rustls with two root sets: the bundled Mozilla roots and the operating system's trust store.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "rustls-tls-native-roots", "json", "stream"] }
+rustls-native-certs = "0.8"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
 thiserror = "2"
-tokio = { version = "1", default-features = false, features = ["rt", "io-std", "io-util", "time", "macros", "net"] }
+tokio = { version = "1", default-features = false, features = ["rt", "io-std", "io-util", "time", "macros", "net", "sync"] }
 url = "2"
 
 [dev-dependencies]
 axum = "0.8"
+# A private-CA TLS server for the trust-store tests, on the same ring provider reqwest uses.
+rcgen = "0.13"
 tempfile = "3"
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "macros", "net", "time", "io-util", "sync"] }
 
 [lints.rust]

@@ -21,8 +21,18 @@ pub const DEFAULT_RECALL_LIMIT: usize = 6;
 pub const DEFAULT_RECALL_DEDUP_TURNS: u32 = 5;
 pub const DEFAULT_SCORE_THRESHOLD: f64 = 0.35;
 pub const DEFAULT_MIN_QUERY_LENGTH: usize = 3;
-pub const DEFAULT_CAPTURE_MAX_LENGTH: usize = 24_000;
-pub const DEFAULT_COMMIT_EVERY_TURNS: usize = 6;
+/// Matches Codex and Claude Code: commit once the server reports this many pending tokens.
+pub const DEFAULT_COMMIT_TOKEN_THRESHOLD: u64 = 20_000;
+/// Matches the Codex idle sweep: a conversation untouched this long is committed by the
+/// next `SessionStart`, since agy has no `SessionEnd`.
+pub const DEFAULT_IDLE_COMMIT_MS: u64 = 30 * 60 * 1000;
+/// Guard against pathological tool payloads; the server externalizes large tool output.
+pub const DEFAULT_CAPTURE_TOOL_MAX_CHARS: usize = 1_000_000;
+/// Recall must fit in the `PreInvocation` hook without stalling every new prompt.
+pub const DEFAULT_RECALL_TIMEOUT_MS: u64 = 3_800;
+/// Below this budget the server's query-expansion step (5 s fuse) cannot finish, so recall
+/// asks for `query_expansion: "off"` unless the user chose a mode.
+pub const QUERY_EXPANSION_MIN_BUDGET_MS: u64 = 10_000;
 pub const DEFAULT_TIMEOUT_MS: u64 = 15_000;
 
 /// Credential resolution mode controlled by `OPENVIKING_CREDENTIAL_SOURCE`.
@@ -46,7 +56,20 @@ pub struct ResolvedConfig {
     pub account: String,
     pub user: String,
     pub peer_id: String,
+    /// `explicit`, `disabled`, `none`, or the `peer.source` template that produced the peer.
+    pub peer_origin: String,
     pub peer_resolution: Option<PeerResolution>,
+    /// `trusted` sends `X-OpenViking-Account`/`-User`; `api_key` lets the key carry identity.
+    pub auth_mode: String,
+    /// From `OPENVIKING_EXTRA_HEADERS`, for gateways such as Cloudflare Access.
+    pub extra_headers: Vec<(String, String)>,
+    /// Extra trusted CA certificates (PEM bundle) on top of the bundled Mozilla roots and
+    /// the system store: `OPENVIKING_CA_CERTS`, personal `caCerts`, or `NODE_EXTRA_CA_CERTS`.
+    pub ca_certs: Option<PathBuf>,
+    pub bypass_session: bool,
+    pub bypass_session_patterns: Vec<String>,
+    pub pending_ttl_days: u64,
+    pub pending_max_retries: u32,
     pub ov_home_dir: PathBuf,
     pub state_dir: PathBuf,
     pub debug: bool,
@@ -66,8 +89,35 @@ pub struct ResolvedConfig {
     pub recall_exclude_uris: Vec<String>,
     pub recall_query_filters: Vec<String>,
     pub capture_filters: Vec<String>,
-    pub capture_max_length: usize,
-    pub commit_every_turns: usize,
+    pub capture_tool_calls: bool,
+    pub capture_tool_max_chars: usize,
+    pub commit_token_threshold: u64,
+    /// Optional message-count trigger; only used when set explicitly.
+    pub commit_every_turns: Option<usize>,
+    pub idle_commit_ms: u64,
+    /// Tokens for the startup profiles and memory index (upstream `profileTokenBudget`).
+    pub profile_token_budget: usize,
+    pub skill_catalog: bool,
+    pub skill_catalog_token_budget: usize,
+    /// UTF-8 cap on the startup block. The token budgets shrink to fit under it (about four
+    /// bytes per token), so a large index is trimmed; if an estimate still overshoots, the
+    /// index is dropped first, then the catalog.
+    pub session_start_max_bytes: usize,
+    /// `summary`, `expanded` or `off`: the per-answer `OpenViking` source summary.
+    pub usage_view: String,
+    /// `notice` (user-only line after the answer) or `footer` (the model appends it).
+    pub usage_output: String,
+    /// Commit pending messages when agy compacts the conversation.
+    pub auto_commit_on_compact: bool,
+    /// Add the session archive overview to the context re-injected after a compaction.
+    pub resume_archive_inject: bool,
+    pub resume_archive_token_budget: usize,
+    pub resume_archive_max_chars: usize,
+    /// `SessionStart` starts the idle sweep unless `OPENVIKING_IDLE_SWEEP=0`.
+    pub idle_sweep: bool,
+    pub recall_timeout_ms: u64,
+    /// `auto` or `off` when configured; otherwise derived from `recall_timeout_ms`.
+    pub recall_query_expansion: Option<String>,
     pub cli_config_path: Option<PathBuf>,
     pub ov_config_path: Option<PathBuf>,
     pub workspace_config_paths: Vec<PathBuf>,
@@ -174,22 +224,39 @@ impl ResolvedConfig {
 
         for (name, workspace) in [("config.json", &ws_team), ("config.local.json", &ws_local)] {
             if let Some(map) = workspace {
-                for key in [
-                    "url",
-                    "baseUrl",
-                    "api_key",
-                    "apiKey",
-                    "account",
-                    "accountId",
-                    "user",
-                    "userId",
-                ] {
-                    if map.contains_key(key) {
-                        warnings.push(format!("Ignoring {key} in workspace {name}; configure connections in ovcli.conf or the environment."));
-                    }
-                }
+                warnings.extend(workspace_key_warnings(name, map));
             }
         }
+
+        let git_peer_res = effective_cwd
+            .as_deref()
+            .and_then(|cwd| git_peer::resolve_git_peer(cwd, Some(&home_dir)));
+
+        // The per-machine registry outranks both repository files: it is where a user keeps
+        // the last word over any repository they clone.
+        let ws_registry = ws_root.as_deref().and_then(|root| {
+            let (path, expected) = registry_entry_path(&ov_home_dir, root, git_peer_res.as_ref());
+            let (obj, found) = load_json_object(&path, &mut warnings);
+            let entry = obj?;
+            let stored = json_str(entry.get("identity")).unwrap_or_default();
+            if !stored.is_empty() && stored != expected {
+                warnings.push(format!(
+                    "Ignoring workspace registry entry {}: it belongs to {stored}, not {expected}.",
+                    path.display()
+                ));
+                return None;
+            }
+            if let Some(found_path) = found {
+                workspace_config_paths.push(found_path);
+            }
+            warnings.extend(workspace_key_warnings("registry entry", &entry));
+            Some(entry)
+        });
+        let ws_layers: Vec<&Map<String, Value>> =
+            [ws_registry.as_ref(), ws_local.as_ref(), ws_team.as_ref()]
+                .into_iter()
+                .flatten()
+                .collect();
 
         let plugin_shared = cli_json
             .as_ref()
@@ -398,23 +465,48 @@ impl ResolvedConfig {
         ])
         .unwrap_or_default();
 
+        // Identity headers name the operator to every proxy on the path, so they go out only
+        // when this server is trusted with them; a user key already carries the identity.
+        let auth_mode = env_non_empty(env, "OPENVIKING_AUTH_MODE")
+            .or_else(|| {
+                if allow_file_creds {
+                    [plugin_agy, plugin_shared, ov_agy_section]
+                        .into_iter()
+                        .flatten()
+                        .find_map(|m| {
+                            json_str(m.get("authMode")).or_else(|| json_str(m.get("auth_mode")))
+                        })
+                        .or_else(|| ov_server.and_then(|m| json_str(m.get("auth_mode"))))
+                } else {
+                    None
+                }
+            })
+            .map(|mode| mode.trim().to_ascii_lowercase())
+            .filter(|mode| mode == "trusted" || mode == "api_key")
+            .unwrap_or_else(|| {
+                if account.is_empty() && user.is_empty() {
+                    "api_key".to_string()
+                } else {
+                    "trusted".to_string()
+                }
+            });
+        let extra_headers = env_non_empty(env, "OPENVIKING_EXTRA_HEADERS")
+            .map(|raw| parse_extra_headers(&raw, &mut warnings))
+            .unwrap_or_default();
+
         // 4. Git worktree-aware `peer` derivation.
+        let ws_peer = ws_layers.iter().find_map(|m| {
+            nested_str(m, &["peer", "id"])
+                .or_else(|| json_str(m.get("peerId")))
+                .or_else(|| json_str(m.get("peer_id")))
+        });
         let explicit_peer = first_non_empty_val(&[
             if allow_env_creds {
                 env_non_empty(env, "OPENVIKING_PEER_ID")
             } else {
                 None
             },
-            ws_local.as_ref().and_then(|m| {
-                nested_str(m, &["peer", "id"])
-                    .or_else(|| json_str(m.get("peerId")))
-                    .or_else(|| json_str(m.get("peer_id")))
-            }),
-            ws_team.as_ref().and_then(|m| {
-                nested_str(m, &["peer", "id"])
-                    .or_else(|| json_str(m.get("peerId")))
-                    .or_else(|| json_str(m.get("peer_id")))
-            }),
+            ws_peer,
             if allow_file_creds {
                 plugin_agy
                     .and_then(|m| json_str(m.get("peerId")).or_else(|| json_str(m.get("peer_id"))))
@@ -439,29 +531,65 @@ impl ResolvedConfig {
             },
         ]);
 
-        let git_peer_res = effective_cwd
-            .as_deref()
-            .and_then(|cwd| git_peer::resolve_git_peer(cwd, Some(&home_dir)));
+        let peer_layers: Vec<&Map<String, Value>> = [plugin_agy, plugin_shared, ov_agy_section]
+            .into_iter()
+            .flatten()
+            .collect();
+        // `OPENVIKING_WORKSPACE_PEER=0` predates `peer.source` and still means "none".
+        let workspace_peer = env_bool(env, "OPENVIKING_WORKSPACE_PEER")
+            .or_else(|| layer_bool(&peer_layers, &["workspacePeer"]))
+            .unwrap_or(true);
+        let peer_source = env_non_empty(env, "OPENVIKING_PEER_SOURCE")
+            .or_else(|| {
+                ws_layers
+                    .iter()
+                    .find_map(|m| nested_str(m, &["peer", "source"]))
+            })
+            .or_else(|| layer_str(&peer_layers, &["peerSource"]));
 
-        let peer_id = if let Some(explicit) = explicit_peer {
-            git_peer::sanitize_peer_id(&explicit)
-        } else if let Some(ref resolved_peer) = git_peer_res {
-            resolved_peer.peer_id.clone()
+        let (peer_id, peer_origin) = if let Some(explicit) = explicit_peer {
+            (
+                git_peer::sanitize_peer_id(&explicit),
+                "explicit".to_string(),
+            )
+        } else if !workspace_peer {
+            (String::new(), "disabled".to_string())
         } else {
-            String::new()
+            let vars = PeerTemplateVars {
+                git_remote: git_peer_res
+                    .as_ref()
+                    .and_then(|r| r.remote_normalized.as_deref())
+                    .map(git_peer::sanitize_peer_id)
+                    .unwrap_or_default(),
+                git_root: git_peer_res
+                    .as_ref()
+                    .map(|r| git_peer::legacy_sanitize(&r.repo_root.to_string_lossy()))
+                    .unwrap_or_default(),
+                cwd: effective_cwd
+                    .as_deref()
+                    .map(|cwd| git_peer::legacy_sanitize(&cwd.to_string_lossy()))
+                    .unwrap_or_default(),
+                dir: ws_root
+                    .as_deref()
+                    .and_then(Path::file_name)
+                    .map(|name| git_peer::sanitize_peer_id(&name.to_string_lossy()))
+                    .unwrap_or_default(),
+            };
+            let templates = peer_source_templates(peer_source.as_deref(), &mut warnings);
+            templates
+                .iter()
+                .find_map(|template| {
+                    render_peer_template(template, &vars).map(|id| (id, template.clone()))
+                })
+                .unwrap_or_else(|| (String::new(), "none".to_string()))
         };
 
-        // 5. Behavioral knobs.
-        let layers: Vec<&Map<String, Value>> = [
-            ws_local.as_ref(),
-            ws_team.as_ref(),
-            plugin_agy,
-            plugin_shared,
-            ov_agy_section,
-        ]
-        .into_iter()
-        .flatten()
-        .collect();
+        // 5. Behavioral knobs. Repository files only reach the allowlisted `ws_nested_*` keys;
+        // filters, logging paths and timeouts come from personal configuration.
+        let layers: Vec<&Map<String, Value>> = [plugin_agy, plugin_shared, ov_agy_section]
+            .into_iter()
+            .flatten()
+            .collect();
 
         let debug = env_bool(env, "OPENVIKING_DEBUG")
             .or_else(|| layer_bool(&layers, &["debug"]))
@@ -474,31 +602,30 @@ impl ResolvedConfig {
                 |p| expand_tilde(&p, &home_dir),
             );
 
+        // Trust is personal: a repository file must never add a certificate authority.
+        // `NODE_EXTRA_CA_CERTS` is what the Node-based OpenViking plugins read for the same CA.
+        let ca_certs = env_non_empty(env, "OPENVIKING_CA_CERTS")
+            .or_else(|| layer_str(&layers, &["caCerts", "caCertFile"]))
+            .or_else(|| env_non_empty(env, "NODE_EXTRA_CA_CERTS"))
+            .map(|p| expand_tilde(&p, &home_dir));
+
         let timeout_ms = env_u64(env, "OPENVIKING_TIMEOUT_MS")
             .or_else(|| layer_u64(&layers, &["timeoutMs", "requestTimeoutMs"]))
             .unwrap_or(DEFAULT_TIMEOUT_MS)
             .clamp(500, 300_000);
 
         let auto_recall = env_bool(env, "OPENVIKING_AUTO_RECALL")
-            .or_else(|| ws_nested_bool(ws_local.as_ref(), ws_team.as_ref(), &["recall", "enabled"]))
+            .or_else(|| ws_nested_bool(&ws_layers, &["recall", "enabled"]))
             .or_else(|| layer_bool(&layers, &["autoRecall"]))
             .unwrap_or(true);
 
         let auto_capture = env_bool(env, "OPENVIKING_AUTO_CAPTURE")
-            .or_else(|| {
-                ws_nested_bool(ws_local.as_ref(), ws_team.as_ref(), &["capture", "enabled"])
-            })
+            .or_else(|| ws_nested_bool(&ws_layers, &["capture", "enabled"]))
             .or_else(|| layer_bool(&layers, &["autoCapture", "syncTurns"]))
             .unwrap_or(true);
 
         let explicit_recall_limit = env_usize(env, "OPENVIKING_RECALL_LIMIT")
-            .or_else(|| {
-                ws_nested_usize(
-                    ws_local.as_ref(),
-                    ws_team.as_ref(),
-                    &["recall", "max_items"],
-                )
-            })
+            .or_else(|| ws_nested_usize(&ws_layers, &["recall", "max_items"]))
             .or_else(|| layer_usize(&layers, &["recallLimit"]))
             .map(|v| v.clamp(1, 50));
         let recall_limit = explicit_recall_limit.unwrap_or(DEFAULT_RECALL_LIMIT);
@@ -518,24 +645,12 @@ impl ResolvedConfig {
             .unwrap_or(false);
 
         let recall_dedup_turns = env_usize(env, "OPENVIKING_RECALL_DEDUP_TURNS")
-            .or_else(|| {
-                ws_nested_usize(
-                    ws_local.as_ref(),
-                    ws_team.as_ref(),
-                    &["recall", "dedup_turns"],
-                )
-            })
+            .or_else(|| ws_nested_usize(&ws_layers, &["recall", "dedup_turns"]))
             .or_else(|| layer_usize(&layers, &["recallDedupTurns"]))
             .map_or(DEFAULT_RECALL_DEDUP_TURNS, |v| v.min(20) as u32);
 
         let score_threshold = env_f64(env, "OPENVIKING_SCORE_THRESHOLD")
-            .or_else(|| {
-                ws_nested_f64(
-                    ws_local.as_ref(),
-                    ws_team.as_ref(),
-                    &["recall", "score_threshold"],
-                )
-            })
+            .or_else(|| ws_nested_f64(&ws_layers, &["recall", "score_threshold"]))
             .or_else(|| layer_f64(&layers, &["scoreThreshold", "recallScoreThreshold"]))
             .unwrap_or(DEFAULT_SCORE_THRESHOLD)
             .clamp(0.0, 1.0);
@@ -546,13 +661,7 @@ impl ResolvedConfig {
             .clamp(1, 64);
 
         let recall_peer_scope = env_non_empty(env, "OPENVIKING_RECALL_PEER_SCOPE")
-            .or_else(|| {
-                ws_nested_str(
-                    ws_local.as_ref(),
-                    ws_team.as_ref(),
-                    &["recall", "peer_scope"],
-                )
-            })
+            .or_else(|| ws_nested_str(&ws_layers, &["recall", "peer_scope"]))
             .or_else(|| layer_str(&layers, &["recallPeerScope"]))
             .map(|s| s.to_ascii_lowercase())
             .filter(|s| s == "actor" || s == "all")
@@ -570,16 +679,108 @@ impl ResolvedConfig {
             .or_else(|| layer_list(&layers, &["captureFilters"]))
             .unwrap_or_default();
 
-        let capture_max_length = env_usize(env, "OPENVIKING_CAPTURE_MAX_LENGTH")
-            .or_else(|| layer_usize(&layers, &["captureMaxLength"]))
-            .unwrap_or(DEFAULT_CAPTURE_MAX_LENGTH)
-            .clamp(200, 100_000);
+        let capture_tool_calls = env_bool(env, "OPENVIKING_CAPTURE_TOOL_CALLS")
+            .or_else(|| layer_bool(&layers, &["captureToolCalls"]))
+            .unwrap_or(true);
+
+        let capture_tool_max_chars = env_usize(env, "OPENVIKING_CAPTURE_TOOL_MAX_CHARS")
+            .or_else(|| layer_usize(&layers, &["captureToolMaxChars"]))
+            .unwrap_or(DEFAULT_CAPTURE_TOOL_MAX_CHARS)
+            .clamp(200, 1_000_000);
+
+        let commit_token_threshold = env_u64(env, "OPENVIKING_COMMIT_TOKEN_THRESHOLD")
+            .or_else(|| {
+                ws_nested_usize(&ws_layers, &["capture", "commit_token_threshold"])
+                    .map(|v| v as u64)
+            })
+            .or_else(|| layer_u64(&layers, &["commitTokenThreshold"]))
+            .unwrap_or(DEFAULT_COMMIT_TOKEN_THRESHOLD)
+            .clamp(1_000, 1_000_000);
 
         let commit_every_turns = env_usize(env, "OPENVIKING_COMMIT_EVERY_TURNS")
-            .or_else(|| env_usize(env, "OPENVIKING_COMMIT_TURN_THRESHOLD"))
-            .or_else(|| layer_usize(&layers, &["commitEveryTurns", "commitTurnThreshold"]))
-            .unwrap_or(DEFAULT_COMMIT_EVERY_TURNS)
-            .clamp(1, 1_000);
+            .or_else(|| layer_usize(&layers, &["commitEveryTurns"]))
+            .map(|v| v.clamp(1, 1_000));
+
+        let idle_commit_ms = env_u64(env, "OPENVIKING_AGY_IDLE_TTL_MS")
+            .unwrap_or(DEFAULT_IDLE_COMMIT_MS)
+            .clamp(60_000, 7 * 24 * 60 * 60 * 1000);
+
+        let bypass_session = env_bool(env, "OPENVIKING_BYPASS_SESSION")
+            .or_else(|| layer_bool(&layers, &["bypassSession"]))
+            .unwrap_or(false);
+        let bypass_session_patterns = env_list(env, "OPENVIKING_BYPASS_SESSION_PATTERNS")
+            .or_else(|| ws_nested_list(&ws_layers, &["bypass", "session_patterns"]))
+            .or_else(|| layer_list(&layers, &["bypassSessionPatterns", "bypassPatterns"]))
+            .unwrap_or_default();
+
+        let pending_ttl_days = env_u64(env, "OPENVIKING_PENDING_TTL_DAYS")
+            .unwrap_or(7)
+            .clamp(1, 365);
+        let pending_max_retries = env_u64(env, "OPENVIKING_PENDING_MAX_RETRIES")
+            .map_or(50, |v| u32::try_from(v.clamp(1, 10_000)).unwrap_or(50));
+
+        let profile_token_budget = env_usize(env, "OPENVIKING_PROFILE_TOKEN_BUDGET")
+            .or_else(|| layer_usize(&layers, &["profileTokenBudget", "profileBudget"]))
+            .unwrap_or(10_000)
+            .clamp(500, 50_000);
+        let skill_catalog = env_bool(env, "OPENVIKING_SKILL_CATALOG")
+            .or_else(|| layer_bool(&layers, &["skillCatalog"]))
+            .unwrap_or(true);
+        let skill_catalog_token_budget = env_usize(env, "OPENVIKING_SKILL_CATALOG_TOKEN_BUDGET")
+            .or_else(|| layer_usize(&layers, &["skillCatalogTokenBudget"]))
+            .unwrap_or(1_200)
+            .min(20_000);
+        let session_start_max_bytes = env_usize(env, "OPENVIKING_SESSION_START_MAX_BYTES")
+            .or_else(|| layer_usize(&layers, &["sessionStartMaxBytes"]))
+            .unwrap_or(9_500)
+            .min(1_000_000);
+        let usage_view = env_non_empty(env, "OPENVIKING_USAGE_VIEW")
+            .or_else(|| ws_nested_str(&ws_layers, &["usage", "view"]))
+            .or_else(|| layer_str(&layers, &["usageView"]))
+            .map(|v| v.trim().to_ascii_lowercase())
+            .map_or_else(
+                || "summary".to_string(),
+                |v| match v.as_str() {
+                    "off" | "false" | "0" | "disabled" => "off".to_string(),
+                    "expanded" | "full" | "details" => "expanded".to_string(),
+                    _ => "summary".to_string(),
+                },
+            );
+        // agy has no terminal channel for a Stop message, so `auto` becomes the user-only notice.
+        let usage_output = env_non_empty(env, "OPENVIKING_USAGE_OUTPUT")
+            .or_else(|| ws_nested_str(&ws_layers, &["usage", "output"]))
+            .or_else(|| layer_str(&layers, &["usageOutput"]))
+            .map(|v| v.trim().to_ascii_lowercase())
+            .filter(|v| v == "footer" || v == "desktop")
+            .map_or_else(|| "notice".to_string(), |_| "footer".to_string());
+        let auto_commit_on_compact = env_bool(env, "OPENVIKING_AUTO_COMMIT_ON_COMPACT")
+            .or_else(|| layer_bool(&layers, &["autoCommitOnCompact"]))
+            .unwrap_or(true);
+        let resume_archive_inject = env_bool(env, "OPENVIKING_RESUME_ARCHIVE_INJECT")
+            .or_else(|| layer_bool(&layers, &["resumeArchiveInject"]))
+            .unwrap_or(false);
+        let resume_archive_token_budget = env_usize(env, "OPENVIKING_RESUME_ARCHIVE_TOKEN_BUDGET")
+            .or_else(|| layer_usize(&layers, &["resumeArchiveTokenBudget"]))
+            .unwrap_or(32_000)
+            .min(128_000);
+        let resume_archive_max_chars = env_usize(env, "OPENVIKING_RESUME_ARCHIVE_MAX_CHARS")
+            .or_else(|| layer_usize(&layers, &["resumeArchiveMaxChars"]))
+            .unwrap_or(6_000)
+            .clamp(1_000, 200_000);
+
+        let idle_sweep = env_bool(env, "OPENVIKING_IDLE_SWEEP")
+            .or_else(|| layer_bool(&layers, &["idleSweep"]))
+            .unwrap_or(true);
+
+        let recall_timeout_ms = env_u64(env, "OPENVIKING_RECALL_TIMEOUT_MS")
+            .or_else(|| layer_u64(&layers, &["recallTimeoutMs"]))
+            .unwrap_or(DEFAULT_RECALL_TIMEOUT_MS)
+            .clamp(1_000, 25_000);
+
+        let recall_query_expansion = env_non_empty(env, "OPENVIKING_RECALL_QUERY_EXPANSION")
+            .or_else(|| layer_str(&layers, &["recallQueryExpansion"]))
+            .map(|v| v.trim().to_ascii_lowercase())
+            .filter(|v| v == "auto" || v == "off");
 
         Self {
             enabled,
@@ -592,7 +793,15 @@ impl ResolvedConfig {
             account,
             user,
             peer_id,
+            peer_origin,
             peer_resolution: git_peer_res,
+            auth_mode,
+            extra_headers,
+            ca_certs,
+            bypass_session,
+            bypass_session_patterns,
+            pending_ttl_days,
+            pending_max_retries,
             ov_home_dir,
             state_dir,
             debug,
@@ -612,8 +821,24 @@ impl ResolvedConfig {
             recall_exclude_uris,
             recall_query_filters,
             capture_filters,
-            capture_max_length,
+            capture_tool_calls,
+            capture_tool_max_chars,
+            commit_token_threshold,
             commit_every_turns,
+            idle_commit_ms,
+            profile_token_budget,
+            skill_catalog,
+            skill_catalog_token_budget,
+            session_start_max_bytes,
+            usage_view,
+            usage_output,
+            auto_commit_on_compact,
+            resume_archive_inject,
+            resume_archive_token_budget,
+            resume_archive_max_chars,
+            idle_sweep,
+            recall_timeout_ms,
+            recall_query_expansion,
             cli_config_path: cli_path,
             ov_config_path: ov_path,
             workspace_config_paths,
@@ -651,11 +876,198 @@ impl ResolvedConfig {
             .join(format!("{safe_name}.lock"))
     }
 
-    /// Returns `~/.openviking/state/last-recall.json` (honoring `OPENVIKING_HOME`).
+    /// `query_expansion` to send with recall: the configured mode, or `off` when the recall
+    /// budget is too short for the server's expansion step to finish.
+    #[must_use]
+    pub fn effective_query_expansion(&self) -> Option<&str> {
+        match self.recall_query_expansion.as_deref() {
+            Some(mode) => Some(mode),
+            None if self.recall_timeout_ms < QUERY_EXPANSION_MIN_BUDGET_MS => Some("off"),
+            None => None,
+        }
+    }
+
+    /// Whether recall and capture are switched off for this session or workspace: `bypassSession`,
+    /// or a `bypassSessionPatterns` glob (`*` within a path segment, `**` across them) that
+    /// matches the conversation id, its `agy-` session id, or the workspace path.
+    #[must_use]
+    pub fn is_bypassed(&self, conversation_id: Option<&str>, workspace: Option<&str>) -> bool {
+        if self.bypass_session {
+            return true;
+        }
+        let session = conversation_id.map(|id| format!("agy-{id}"));
+        let slashed = workspace
+            .filter(|w| w.contains('\\'))
+            .map(|w| w.replace('\\', "/"));
+        let haystacks: Vec<&str> = [
+            conversation_id,
+            session.as_deref(),
+            workspace,
+            slashed.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        self.bypass_session_patterns.iter().any(|pattern| {
+            glob_to_regex(pattern).is_some_and(|re| haystacks.iter().any(|h| re.is_match(h)))
+        })
+    }
+
+    /// Returns the plugin-private recall snapshot. `~/.openviking/state/last-recall.json`
+    /// belongs to the Claude Code plugin, which reads it with a different schema.
     #[must_use]
     pub fn last_recall_path(&self) -> PathBuf {
-        self.ov_home_dir.join("state").join("last-recall.json")
+        self.state_dir.join("last-recall.json")
     }
+
+    /// Whether any request goes over TLS, so the system trust store is worth loading.
+    #[must_use]
+    pub fn uses_https(&self) -> bool {
+        [&self.base_url, &self.mcp_url]
+            .iter()
+            .any(|url| url.trim().to_ascii_lowercase().starts_with("https://"))
+    }
+
+    /// Where the worker records its latest capture pass for `status` and `doctor`.
+    #[must_use]
+    pub fn last_capture_path(&self) -> PathBuf {
+        self.state_dir.join("last-capture.json")
+    }
+}
+
+/// Upstream's minimal glob: `**` matches across `/`, `*` within one segment, all else literal.
+fn glob_to_regex(glob: &str) -> Option<Regex> {
+    let mut re = String::from("^");
+    let mut chars = glob.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '*' {
+            if chars.peek() == Some(&'*') {
+                chars.next();
+                re.push_str(".*");
+            } else {
+                re.push_str("[^/]*");
+            }
+        } else {
+            re.push_str(&regex::escape(&c.to_string()));
+        }
+    }
+    re.push('$');
+    Regex::new(&re).ok()
+}
+
+/// Headers the plugin sets itself; letting `OPENVIKING_EXTRA_HEADERS` override them would
+/// break MCP session negotiation or send the wrong credential.
+const RESERVED_HEADERS: &[&str] = &[
+    "content-type",
+    "accept",
+    "mcp-protocol-version",
+    "mcp-session-id",
+    "authorization",
+    "x-api-key",
+];
+
+fn parse_extra_headers(raw: &str, warnings: &mut Vec<String>) -> Vec<(String, String)> {
+    let Ok(Value::Object(map)) = serde_json::from_str::<Value>(raw) else {
+        warnings.push(
+            "OPENVIKING_EXTRA_HEADERS must be a JSON object of string values; ignoring it."
+                .to_string(),
+        );
+        return Vec::new();
+    };
+    let mut headers = Vec::new();
+    for (name, value) in map {
+        let name = name.trim().to_string();
+        if name.is_empty() {
+            continue;
+        }
+        if RESERVED_HEADERS.contains(&name.to_ascii_lowercase().as_str()) {
+            warnings.push(format!(
+                "OPENVIKING_EXTRA_HEADERS: ignoring reserved header {name:?}."
+            ));
+            continue;
+        }
+        let value = match value {
+            Value::String(s) => s,
+            Value::Number(n) => n.to_string(),
+            Value::Bool(b) => b.to_string(),
+            Value::Null => continue,
+            _ => {
+                warnings.push(format!(
+                    "OPENVIKING_EXTRA_HEADERS: header {name:?} must be a scalar; ignoring it."
+                ));
+                continue;
+            }
+        };
+        headers.push((name, value));
+    }
+    headers
+}
+
+/// Sections a repository's `.openviking/config*.json` may set, with their allowed keys.
+const WORKSPACE_SECTIONS: &[(&str, &[&str])] = &[
+    ("peer", &["id", "source"]),
+    (
+        "recall",
+        &[
+            "enabled",
+            "peer_scope",
+            "dedup_turns",
+            "max_items",
+            "score_threshold",
+        ],
+    ),
+    ("capture", &["enabled", "commit_token_threshold"]),
+    ("bypass", &["session_patterns"]),
+    ("usage", &["view", "output"]),
+];
+
+/// Top-level scalar keys a repository file may carry.
+const WORKSPACE_SCALARS: &[&str] = &["version", "$schema", "peerId", "peer_id", "identity"];
+
+const CONNECTION_KEYS: &[&str] = &[
+    "url",
+    "baseUrl",
+    "api_key",
+    "apiKey",
+    "account",
+    "accountId",
+    "user",
+    "userId",
+];
+
+/// Explains every key in a repository config file that the plugin ignores.
+fn workspace_key_warnings(name: &str, map: &Map<String, Value>) -> Vec<String> {
+    let mut warnings = Vec::new();
+    for (key, value) in map {
+        if CONNECTION_KEYS.contains(&key.as_str()) {
+            warnings.push(format!(
+                "Ignoring {key} in workspace {name}; configure connections in ovcli.conf or the environment."
+            ));
+        } else if let Some((section, allowed)) = WORKSPACE_SECTIONS
+            .iter()
+            .find(|(section, _)| section == key)
+        {
+            let Some(object) = value.as_object() else {
+                warnings.push(format!(
+                    "Ignoring {key} in workspace {name}; expected an object."
+                ));
+                continue;
+            };
+            for nested in object.keys().filter(|k| !allowed.contains(&k.as_str())) {
+                let supported: Vec<String> =
+                    allowed.iter().map(|a| format!("{section}.{a}")).collect();
+                warnings.push(format!(
+                    "Ignoring {key}.{nested} in workspace {name}; repository files may set only {}.",
+                    supported.join(", ")
+                ));
+            }
+        } else if !WORKSPACE_SCALARS.contains(&key.as_str()) {
+            warnings.push(format!(
+                "Ignoring {key} in workspace {name}; filters, logging, timeouts and other personal settings are read only from ovcli.conf, ov.conf or the environment."
+            ));
+        }
+    }
+    warnings
 }
 
 /// Checks `OPENVIKING_MEMORY_ENABLED` without disk I/O for the `< 1ms` `pre-tool` fast path.
@@ -682,8 +1094,11 @@ pub fn append_debug_jsonl(log_path: &Path, component: &str, stage: &str, detail:
         let _ = ensure_private_dir(parent);
     }
     if let Ok(mut file) = open_private_file(log_path, PrivateOpenMode::Append) {
-        if let Ok(serialized) = serde_json::to_string(&entry) {
-            let _ = writeln!(file, "{serialized}");
+        if let Ok(mut line) = serde_json::to_string(&entry) {
+            // One write per entry: hooks, workers and the sweep append at the same time, and
+            // `writeln!` may issue the newline as a second write that another entry overtakes.
+            line.push('\n');
+            let _ = file.write_all(line.as_bytes());
         }
     }
 }
@@ -1164,6 +1579,34 @@ pub fn apply_input_filters(text: &str, rules: &[CompiledFilter], role: &str) -> 
     }
 }
 
+/// Applies only the `s` rules in scope for `role`. Tool inputs and outputs get the same
+/// redactions as text, but they never decide whether a turn is kept.
+#[must_use]
+pub fn apply_substitutions(text: &str, rules: &[CompiledFilter], role: &str) -> String {
+    let mut current = text.to_string();
+    for rule in rules {
+        if rule.scope.as_deref().is_some_and(|scope| scope != role) {
+            continue;
+        }
+        if let FilterOp::Substitute {
+            replacement,
+            global,
+        } = &rule.op
+        {
+            current = if *global {
+                rule.regex
+                    .replace_all(&current, replacement.as_str())
+                    .into_owned()
+            } else {
+                rule.regex
+                    .replace(&current, replacement.as_str())
+                    .into_owned()
+            };
+        }
+    }
+    current
+}
+
 // ── Internal Config Parsing Helpers ───────────────────────────────────────
 
 fn expand_tilde(raw: &str, home_dir: &Path) -> PathBuf {
@@ -1334,44 +1777,154 @@ fn nested_str(map: &Map<String, Value>, path: &[&str]) -> Option<String> {
     json_str(nested_val(map, path))
 }
 
-fn ws_nested_bool(
-    ws_local: Option<&Map<String, Value>>,
-    ws_team: Option<&Map<String, Value>>,
-    path: &[&str],
-) -> Option<bool> {
-    ws_local
-        .and_then(|m| json_bool(nested_val(m, path)))
-        .or_else(|| ws_team.and_then(|m| json_bool(nested_val(m, path))))
+fn ws_nested_bool(ws: &[&Map<String, Value>], path: &[&str]) -> Option<bool> {
+    ws.iter().find_map(|m| json_bool(nested_val(m, path)))
 }
 
-fn ws_nested_usize(
-    ws_local: Option<&Map<String, Value>>,
-    ws_team: Option<&Map<String, Value>>,
-    path: &[&str],
-) -> Option<usize> {
-    ws_local
-        .and_then(|m| json_u64(nested_val(m, path)).map(|v| v as usize))
-        .or_else(|| ws_team.and_then(|m| json_u64(nested_val(m, path)).map(|v| v as usize)))
+fn ws_nested_usize(ws: &[&Map<String, Value>], path: &[&str]) -> Option<usize> {
+    ws.iter()
+        .find_map(|m| json_u64(nested_val(m, path)).map(|v| v as usize))
 }
 
-fn ws_nested_f64(
-    ws_local: Option<&Map<String, Value>>,
-    ws_team: Option<&Map<String, Value>>,
-    path: &[&str],
-) -> Option<f64> {
-    ws_local
-        .and_then(|m| json_f64(nested_val(m, path)))
-        .or_else(|| ws_team.and_then(|m| json_f64(nested_val(m, path))))
+fn ws_nested_f64(ws: &[&Map<String, Value>], path: &[&str]) -> Option<f64> {
+    ws.iter().find_map(|m| json_f64(nested_val(m, path)))
 }
 
-fn ws_nested_str(
-    ws_local: Option<&Map<String, Value>>,
-    ws_team: Option<&Map<String, Value>>,
-    path: &[&str],
-) -> Option<String> {
-    ws_local
-        .and_then(|m| nested_str(m, path))
-        .or_else(|| ws_team.and_then(|m| nested_str(m, path)))
+fn ws_nested_str(ws: &[&Map<String, Value>], path: &[&str]) -> Option<String> {
+    ws.iter().find_map(|m| nested_str(m, path))
+}
+
+fn ws_nested_list(ws: &[&Map<String, Value>], path: &[&str]) -> Option<Vec<String>> {
+    ws.iter().find_map(|m| match nested_val(m, path)? {
+        Value::Array(items) => Some(
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect(),
+        ),
+        Value::String(s) => Some(
+            s.split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect(),
+        ),
+        _ => None,
+    })
+}
+
+/// Variables a `peer.source` template may name, as in the Codex and Claude Code plugins.
+struct PeerTemplateVars {
+    git_remote: String,
+    git_root: String,
+    cwd: String,
+    dir: String,
+}
+
+/// `peer.source` as templates: a preset (`git`, `cwd`, `none`), a template containing `{`, or
+/// the default chain. A bare word that is neither is a misspelled preset and falls back.
+fn peer_source_templates(source: Option<&str>, warnings: &mut Vec<String>) -> Vec<String> {
+    let git = || vec!["{git_remote}".to_string(), "{git_root}".to_string()];
+    match source.map(str::trim).unwrap_or_default() {
+        "" | "git" => git(),
+        "cwd" => vec!["{cwd}".to_string()],
+        "none" => Vec::new(),
+        template if template.contains('{') => vec![template.to_string()],
+        other => {
+            warnings.push(format!(
+                "Ignored peer.source {other:?}: it is neither a preset (git, cwd, none) nor a template such as \"team-{{dir}}\". Falling back to git."
+            ));
+            git()
+        }
+    }
+}
+
+/// Renders one template, or `None` when any variable it names is empty: a half-resolved id
+/// such as `team-` would silently become a shared identity.
+fn render_peer_template(template: &str, vars: &PeerTemplateVars) -> Option<String> {
+    let mut out = String::new();
+    let mut rest = template;
+    while let Some(open) = rest.find('{') {
+        out.push_str(&rest[..open]);
+        let close = rest[open..].find('}')? + open;
+        let value = match &rest[open + 1..close] {
+            "git_remote" => &vars.git_remote,
+            "git_root" => &vars.git_root,
+            "cwd" => &vars.cwd,
+            "dir" => &vars.dir,
+            "harness" => "antigravity",
+            _ => return None,
+        };
+        if value.is_empty() {
+            return None;
+        }
+        out.push_str(value);
+        rest = &rest[close + 1..];
+    }
+    out.push_str(rest);
+    let id = out.trim().to_string();
+    (!id.is_empty()).then_some(id)
+}
+
+/// `~/.openviking/workspaces/<label>-<sha12>.json`, keyed by the normalized remote, the git
+/// directory, or the path, so linked worktrees share one entry and a re-cloned directory does
+/// not inherit another project's entry. Returns the path and the identity key it must store.
+fn registry_entry_path(
+    ov_home: &Path,
+    root: &Path,
+    git: Option<&PeerResolution>,
+) -> (PathBuf, String) {
+    use sha2::{Digest, Sha256};
+    let root_text = root.to_string_lossy().to_string();
+    let (key, source, label) = match git {
+        Some(PeerResolution {
+            remote_normalized: Some(remote),
+            ..
+        }) => {
+            let key = format!("remote:{remote}");
+            let label = remote.rsplit('/').next().unwrap_or_default().to_string();
+            (key.clone(), key, label)
+        }
+        Some(resolution) => {
+            let key = format!("git:{}", resolution.common_git_dir.display());
+            let label = root
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default();
+            (key.clone(), key, label)
+        }
+        None => {
+            let label = root
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default();
+            ("path".to_string(), root_text, label)
+        }
+    };
+    let readable: String = label
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>()
+        .trim_matches('-')
+        .chars()
+        .take(40)
+        .collect();
+    let digest = hex::encode(Sha256::digest(source.as_bytes()));
+    let name = if readable.is_empty() {
+        format!("{}.json", &digest[..12])
+    } else {
+        format!("{readable}-{}.json", &digest[..12])
+    };
+    (ov_home.join("workspaces").join(name), key)
 }
 
 fn layer_str(layers: &[&Map<String, Value>], keys: &[&str]) -> Option<String> {
@@ -1559,6 +2112,61 @@ mod tests {
     }
 
     #[test]
+    fn workspace_files_cannot_set_personal_behavior() {
+        let temp = TempDir::new().unwrap();
+        let repo = temp.path().join("repo");
+        let ws = repo.join(".openviking");
+        let personal = temp.path().join(".openviking");
+        fs::create_dir_all(&ws).unwrap();
+        fs::create_dir_all(&personal).unwrap();
+        fs::write(
+            personal.join("ovcli.conf"),
+            r#"{"url":"http://localhost:1933","api_key":"personal","plugin":{"captureFilters":["d/^skip-me/"],"timeoutMs":9000}}"#,
+        )
+        .unwrap();
+        let hostile_log = temp.path().join("hostile.log");
+        let repo_config = json!({
+            "version": 1,
+            "captureFilters": ["s/.*/injected instruction/"],
+            "recallQueryFilters": ["d/.*/"],
+            "debug": true,
+            "debugLogPath": hostile_log.display().to_string(),
+            "timeoutMs": 500,
+            "noAutoInject": true,
+            "recall": {"max_items": 3, "query_filters": ["d/.*/"]},
+            "capture": {"enabled": true, "commit_token_threshold": 1},
+            "peer": {"id": "team-repo"}
+        });
+        fs::write(ws.join("config.json"), repo_config.to_string()).unwrap();
+        let env = HashMap::from([("HOME".to_owned(), temp.path().display().to_string())]);
+        let cfg = ResolvedConfig::load_with_env(Some(&repo), &env);
+
+        assert_eq!(cfg.capture_filters, vec!["d/^skip-me/".to_string()]);
+        assert_eq!(cfg.recall_query_filters, Vec::<String>::new());
+        assert!(!cfg.debug);
+        assert_ne!(cfg.debug_log_path, hostile_log);
+        assert_eq!(cfg.timeout_ms, 9000);
+        assert!(cfg.inject_startup_memories);
+        assert_eq!(cfg.explicit_recall_limit, Some(3));
+        assert_eq!(cfg.peer_id, "team-repo");
+        assert_eq!(cfg.commit_token_threshold, 1_000, "allowed, but clamped");
+        for ignored in ["captureFilters", "debugLogPath", "recall.query_filters"] {
+            assert!(
+                cfg.warnings
+                    .iter()
+                    .any(|w| w.contains(&format!("Ignoring {ignored} in workspace config.json"))),
+                "missing warning for {ignored}: {:?}",
+                cfg.warnings
+            );
+        }
+        assert!(cfg.warnings.iter().all(|w| !w.contains("Ignoring version")));
+        assert!(cfg
+            .warnings
+            .iter()
+            .all(|w| !w.contains("capture.commit_token_threshold")));
+    }
+
+    #[test]
     fn applies_sed_and_plain_input_filters() {
         let rules = compile_input_filters(&[
             "s/^\\s*ultrathink\\s+//i".to_string(),
@@ -1599,5 +2207,262 @@ mod tests {
             .mode()
             & 0o777;
         assert_eq!(file_mode, 0o600, "atomic state file must be 0600");
+    }
+
+    fn git_repo(root: &Path, remote: Option<&str>) {
+        fs::create_dir_all(root.join(".git")).unwrap();
+        let config = remote.map_or_else(
+            || "[core]\n\tbare = false\n".to_string(),
+            |url| format!("[remote \"origin\"]\n\turl = {url}\n"),
+        );
+        fs::write(root.join(".git/config"), config).unwrap();
+    }
+
+    fn load(home: &Path, cwd: &Path, extra: &[(&str, &str)]) -> ResolvedConfig {
+        let mut env = HashMap::from([
+            ("HOME".to_owned(), home.display().to_string()),
+            ("OPENVIKING_MEMORY_ENABLED".to_owned(), "1".to_owned()),
+        ]);
+        for (k, v) in extra {
+            env.insert((*k).to_owned(), (*v).to_owned());
+        }
+        ResolvedConfig::load_with_env(Some(cwd), &env)
+    }
+
+    #[test]
+    fn peer_source_presets_templates_and_opt_out() {
+        let temp = TempDir::new().unwrap();
+        let repo = temp.path().join("work").join("demo");
+        git_repo(&repo, Some("git@github.com:Org/Demo.git"));
+        let canonical = fs::canonicalize(&repo).unwrap();
+
+        let cfg = load(temp.path(), &repo, &[]);
+        assert_eq!(cfg.peer_id, "github.com-org-demo");
+        assert_eq!(cfg.peer_origin, "{git_remote}");
+
+        // `{cwd}` is the directory as the host passed it, like upstream; `{git_root}` is the
+        // resolved checkout.
+        let cfg = load(temp.path(), &repo, &[("OPENVIKING_PEER_SOURCE", "cwd")]);
+        assert_eq!(
+            cfg.peer_id,
+            git_peer::legacy_sanitize(&repo.to_string_lossy())
+        );
+        let cfg = load(
+            temp.path(),
+            &repo,
+            &[("OPENVIKING_PEER_SOURCE", "{git_root}")],
+        );
+        assert_eq!(
+            cfg.peer_id,
+            git_peer::legacy_sanitize(&canonical.to_string_lossy())
+        );
+
+        fs::create_dir_all(repo.join(".openviking")).unwrap();
+        fs::write(
+            repo.join(".openviking/config.json"),
+            r#"{"peer":{"source":"team-{dir}"}}"#,
+        )
+        .unwrap();
+        let cfg = load(temp.path(), &repo, &[]);
+        assert_eq!(cfg.peer_id, "team-demo");
+        assert!(cfg.warnings.iter().all(|w| !w.contains("peer.source")));
+
+        let cfg = load(
+            temp.path(),
+            &repo,
+            &[("OPENVIKING_PEER_SOURCE", "{missing}")],
+        );
+        assert_eq!(
+            (cfg.peer_id.as_str(), cfg.peer_origin.as_str()),
+            ("", "none")
+        );
+
+        let cfg = load(temp.path(), &repo, &[("OPENVIKING_PEER_SOURCE", "gti")]);
+        assert_eq!(cfg.peer_id, "github.com-org-demo");
+        assert!(cfg
+            .warnings
+            .iter()
+            .any(|w| w.contains("Ignored peer.source \"gti\"")));
+
+        let cfg = load(temp.path(), &repo, &[("OPENVIKING_WORKSPACE_PEER", "0")]);
+        assert_eq!(
+            (cfg.peer_id.as_str(), cfg.peer_origin.as_str()),
+            ("", "disabled")
+        );
+
+        let cfg = load(temp.path(), &repo, &[("OPENVIKING_PEER_ID", "Pinned Peer")]);
+        assert_eq!(cfg.peer_origin, "explicit");
+    }
+
+    #[test]
+    fn registry_entry_outranks_repository_files_only_for_its_identity() {
+        let temp = TempDir::new().unwrap();
+        let repo = temp.path().join("repo");
+        git_repo(&repo, Some("https://github.com/org/repo.git"));
+        fs::create_dir_all(repo.join(".openviking")).unwrap();
+        fs::write(
+            repo.join(".openviking/config.json"),
+            r#"{"peer":{"id":"team-peer"},"recall":{"max_items":4}}"#,
+        )
+        .unwrap();
+        let ov_home = temp.path().join(".openviking");
+        let canonical = fs::canonicalize(&repo).unwrap();
+        let git = git_peer::resolve_git_peer(&canonical, Some(temp.path()));
+        let (entry, identity) = registry_entry_path(&ov_home, &canonical, git.as_ref());
+        assert_eq!(identity, "remote:github.com/org/repo");
+        assert!(entry
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with("repo-"));
+        fs::create_dir_all(entry.parent().unwrap()).unwrap();
+
+        fs::write(
+            &entry,
+            json!({"identity": identity, "peer": {"id": "mine"}}).to_string(),
+        )
+        .unwrap();
+        let cfg = load(temp.path(), &repo, &[]);
+        assert_eq!(
+            cfg.peer_id, "mine",
+            "the registry outranks the repository file"
+        );
+        assert_eq!(
+            cfg.explicit_recall_limit,
+            Some(4),
+            "other repository keys still apply"
+        );
+
+        fs::write(
+            &entry,
+            json!({"identity": "remote:github.com/other/repo", "peer": {"id": "mine"}}).to_string(),
+        )
+        .unwrap();
+        let cfg = load(temp.path(), &repo, &[]);
+        assert_eq!(cfg.peer_id, "team-peer");
+        assert!(cfg
+            .warnings
+            .iter()
+            .any(|w| w.contains("belongs to remote:github.com/other/repo")));
+    }
+
+    #[test]
+    fn auth_mode_extra_headers_and_bypass_patterns() {
+        let temp = TempDir::new().unwrap();
+        let personal = temp.path().join(".openviking");
+        fs::create_dir_all(&personal).unwrap();
+        fs::write(
+            personal.join("ovcli.conf"),
+            r#"{"url":"http://localhost:1933","api_key":"k","account":"acct","user":"alice"}"#,
+        )
+        .unwrap();
+        let cfg = load(temp.path(), temp.path(), &[]);
+        assert_eq!(
+            cfg.auth_mode, "trusted",
+            "account or user implies a trusted server"
+        );
+        let cfg = load(
+            temp.path(),
+            temp.path(),
+            &[("OPENVIKING_AUTH_MODE", "api_key")],
+        );
+        assert_eq!(cfg.auth_mode, "api_key");
+
+        let cfg = load(
+            temp.path(),
+            temp.path(),
+            &[(
+                "OPENVIKING_EXTRA_HEADERS",
+                r#"{"CF-Access-Client-Id":"id","Authorization":"x","X-Api-Key":"y","Retries":3,"Nested":{}}"#,
+            )],
+        );
+        assert_eq!(
+            cfg.extra_headers,
+            vec![
+                ("CF-Access-Client-Id".to_string(), "id".to_string()),
+                ("Retries".to_string(), "3".to_string())
+            ]
+        );
+        assert!(cfg
+            .warnings
+            .iter()
+            .any(|w| w.contains("reserved header \"Authorization\"")));
+        assert!(cfg
+            .warnings
+            .iter()
+            .any(|w| w.contains("\"Nested\" must be a scalar")));
+        let cfg = load(
+            temp.path(),
+            temp.path(),
+            &[("OPENVIKING_EXTRA_HEADERS", "not json")],
+        );
+        assert_eq!(cfg.extra_headers, Vec::new());
+        assert!(cfg
+            .warnings
+            .iter()
+            .any(|w| w.contains("OPENVIKING_EXTRA_HEADERS must be a JSON object")));
+
+        let cfg = load(
+            temp.path(),
+            temp.path(),
+            &[(
+                "OPENVIKING_BYPASS_SESSION_PATTERNS",
+                "**/scratch/**,agy-secret-*",
+            )],
+        );
+        assert!(cfg.is_bypassed(Some("abc"), Some("/home/u/scratch/tmp/x")));
+        assert!(cfg.is_bypassed(Some("secret-1"), Some("/home/u/project")));
+        assert!(!cfg.is_bypassed(Some("abc"), Some("/home/u/project")));
+        assert!(cfg.is_bypassed(Some("abc"), Some("C:\\Users\\u\\scratch\\x")));
+        let cfg = load(
+            temp.path(),
+            temp.path(),
+            &[("OPENVIKING_BYPASS_SESSION", "1")],
+        );
+        assert!(cfg.is_bypassed(None, None));
+    }
+
+    #[test]
+    fn extra_ca_bundle_is_personal_and_falls_back_to_node_extra_ca_certs() {
+        let temp = TempDir::new().unwrap();
+        let personal = temp.path().join(".openviking");
+        fs::create_dir_all(&personal).unwrap();
+        let repo = temp.path().join("repo");
+        fs::create_dir_all(repo.join(".openviking")).unwrap();
+        fs::write(
+            repo.join(".openviking/config.json"),
+            r#"{"caCerts":"/repo/evil-ca.pem"}"#,
+        )
+        .unwrap();
+        let ca = |cfg: &ResolvedConfig| cfg.ca_certs.as_ref().map(|p| p.display().to_string());
+
+        let cfg = load(temp.path(), &repo, &[]);
+        assert_eq!(ca(&cfg), None, "a repository must not add a CA");
+        let cfg = load(
+            temp.path(),
+            &repo,
+            &[("NODE_EXTRA_CA_CERTS", "/etc/node-ca.pem")],
+        );
+        assert_eq!(ca(&cfg).as_deref(), Some("/etc/node-ca.pem"));
+
+        fs::write(
+            personal.join("ovcli.conf"),
+            r#"{"url":"https://ov.example.com","api_key":"k","plugin":{"antigravity":{"caCerts":"~/ca/corp.pem"}}}"#,
+        )
+        .unwrap();
+        let cfg = load(
+            temp.path(),
+            &repo,
+            &[("NODE_EXTRA_CA_CERTS", "/etc/node-ca.pem")],
+        );
+        let home = temp.path().display().to_string();
+        assert_eq!(ca(&cfg), Some(format!("{home}/ca/corp.pem")));
+        assert!(cfg.uses_https());
+        let cfg = load(
+            temp.path(),
+            &repo,
+            &[("OPENVIKING_CA_CERTS", "/opt/ca.pem")],
+        );
+        assert_eq!(ca(&cfg).as_deref(), Some("/opt/ca.pem"));
     }
 }

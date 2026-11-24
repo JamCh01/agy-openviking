@@ -63,6 +63,11 @@ struct MockServerState {
     observed_peers: Mutex<Vec<String>>,
     observed_auth_headers: Mutex<Vec<ObservedAuth>>,
     fail_messages_503: AtomicBool,
+    gateway_html_messages: AtomicBool,
+    batch_enabled: AtomicBool,
+    batch_calls: AtomicUsize,
+    session_meta_enabled: AtomicBool,
+    pending_tokens: AtomicUsize,
     captured_messages: Mutex<Vec<CapturedSessionMessage>>,
     committed_sessions: Mutex<Vec<String>>,
     mcp_initialize_calls: AtomicUsize,
@@ -94,6 +99,11 @@ async fn spawn_mock_ov_server(state: Arc<MockServerState>) -> SpawnedServer {
             "/api/v1/sessions/{session_id}/messages",
             post(handle_add_message),
         )
+        .route(
+            "/api/v1/sessions/{session_id}/messages/batch",
+            post(handle_batch_add_messages),
+        )
+        .route("/api/v1/sessions/{session_id}", get(handle_get_session))
         .route(
             "/api/v1/sessions/{session_id}/commit",
             post(handle_commit_session),
@@ -283,6 +293,14 @@ async fn handle_add_message(
         )
             .into_response();
     }
+    if state.gateway_html_messages.load(Ordering::SeqCst) {
+        return (
+            StatusCode::OK,
+            [("content-type", "text/html")],
+            "<html><body>Sign in to continue</body></html>",
+        )
+            .into_response();
+    }
 
     state
         .captured_messages
@@ -300,6 +318,42 @@ async fn handle_add_message(
             "message_count": 1
         }
     }))
+    .into_response()
+}
+
+async fn handle_batch_add_messages(
+    State(state): State<Arc<MockServerState>>,
+    headers: HeaderMap,
+    AxumPath(session_id): AxumPath<String>,
+    Json(body): Json<Value>,
+) -> Response {
+    record_common_headers(&state, &headers);
+    if !state.batch_enabled.load(Ordering::SeqCst) {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    state.batch_calls.fetch_add(1, Ordering::SeqCst);
+    let messages = body["messages"].as_array().cloned().unwrap_or_default();
+    let mut captured = state.captured_messages.lock().unwrap();
+    for message in &messages {
+        captured.push(CapturedSessionMessage {
+            session_id: session_id.clone(),
+            body: message.clone(),
+        });
+    }
+    Json(json!({"status": "ok", "result": {"added": messages.len()}})).into_response()
+}
+
+async fn handle_get_session(
+    State(state): State<Arc<MockServerState>>,
+    AxumPath(session_id): AxumPath<String>,
+) -> Response {
+    if !state.session_meta_enabled.load(Ordering::SeqCst) {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    Json(json!({"status": "ok", "result": {
+        "session_id": session_id,
+        "pending_tokens": state.pending_tokens.load(Ordering::SeqCst)
+    }}))
     .into_response()
 }
 
@@ -480,11 +534,18 @@ fn run_hook_cmd(args: &[&str], stdin_json: &str, envs: &[(&str, &str)]) -> Comma
         "OPENVIKING_HOME",
         "OPENVIKING_PEER_ID",
         "OPENVIKING_CREDENTIAL_SOURCE",
+        "OPENVIKING_CA_CERTS",
+        "NODE_EXTRA_CA_CERTS",
+        "SSL_CERT_FILE",
+        "SSL_CERT_DIR",
         "PLUGIN_DATA",
     ] {
         cmd.env_remove(key);
     }
 
+    // A detached sweep started by SessionStart would race the test's own workers; the sweep
+    // test runs `ov-agy sweep` directly instead.
+    cmd.env("OPENVIKING_IDLE_SWEEP", "0");
     for (key, value) in envs {
         cmd.env(key, value);
     }
@@ -576,24 +637,20 @@ fn test_1_pre_tool_use_guard() {
         "deny reason must mention viking:// virtual filesystem"
     );
 
-    // 2. Local `view_file` -> decision: "allow" (never `{}`)
-    let allow_res = run_hook_cmd(
+    // 2. Local `view_file` -> decision: "ask". agy denies `{}`, and `allow` would bypass the
+    //    user's own permission rules, so reads are handed to the normal permission flow too.
+    let read_res = run_hook_cmd(
         &["hook", "pre-tool"],
         r#"{"toolCall":{"id":"call_2","name":"view_file","args":{"AbsolutePath":"/Users/dev/project/README.md"}}}"#,
         &[("HOME", home)],
     );
-    assert_eq!(allow_res.exit_code, 0, "pre-tool must exit 0 on allow");
-    assert_ne!(
-        allow_res.stdout.trim(),
-        "{}",
-        "PreToolUse must never emit empty JSON object"
-    );
-    let allow_json: Value =
-        serde_json::from_str(allow_res.stdout.trim()).expect("allow output must be valid JSON");
+    assert_eq!(read_res.exit_code, 0, "pre-tool must exit 0 on local reads");
+    let read_json: Value =
+        serde_json::from_str(read_res.stdout.trim()).expect("read output must be valid JSON");
     assert_eq!(
-        allow_json,
-        json!({ "decision": "allow" }),
-        "read-only view_file on local path must return decision=allow"
+        read_json,
+        json!({ "decision": "ask" }),
+        "read-only view_file on local path must defer to the user's permission flow"
     );
 
     // 3. Local `write_to_file` -> decision: "ask" (never `{}`)
@@ -735,8 +792,8 @@ async fn test_2_pre_invocation_loop_dedup() {
         "Authorization Bearer header must match configured key"
     );
     assert_eq!(
-        auth_hdrs[0].api_key, "user-key-valid-12345",
-        "X-API-Key header must match configured key"
+        auth_hdrs[0].api_key, "",
+        "the key travels only as Bearer; X-API-Key would duplicate it"
     );
 
     // Append model tool-call step (same user turn) and invoke `invocationNum: 1`.
@@ -829,13 +886,23 @@ async fn test_2_pre_invocation_loop_dedup() {
             .contains("Now check SSE reconnection semantics"),
         "invocation 3 must inject recalled context for the new prompt"
     );
+    let snapshot: Value = serde_json::from_str(
+        &fs::read_to_string(paths.plugin_data.join("last-recall.json"))
+            .expect("last-recall.json must live in the plugin data directory"),
+    )
+    .expect("last-recall.json must be JSON");
+    assert_eq!(snapshot["outcome"], "injected");
     assert!(
-        paths
+        snapshot.get("query_preview").is_none(),
+        "the snapshot must not keep prompt text"
+    );
+    assert!(
+        !paths
             .ov_home
             .join("state")
             .join("last-recall.json")
-            .is_file(),
-        "last-recall.json audit snapshot must exist"
+            .exists(),
+        "~/.openviking/state/last-recall.json belongs to the Claude Code plugin"
     );
 }
 
@@ -1101,7 +1168,9 @@ async fn test_4_worker_sanitization_and_offline_wal() {
     assert_eq!(stop_out.exit_code, 0, "stop hook must exit 0");
     assert_eq!(stop_out.stdout.trim(), "{}", "stop hook must emit `{{}}`");
 
-    let deadline = Instant::now() + Duration::from_secs(5);
+    // The detached worker is a fresh process; under a loaded parallel run (or while macOS
+    // scans a newly built binary) it can take several seconds to start.
+    let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         let count = mock_state
             .captured_messages
@@ -1760,6 +1829,16 @@ async fn test_8_cold_start_concurrent_fetch_and_sha256_guard() {
         archive_downloads.load(Ordering::SeqCst) >= 1,
         "cold start must fetch archive from OPENVIKING_RELEASE_BASE_URL"
     );
+    // A hook that raced process A may have started a background fetch; let it finish.
+    let fetch_lock = plugin_data_dir.join("locks").join("fetch-v9.8.7.lock");
+    let lock_deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while fetch_lock.exists() && std::time::Instant::now() < lock_deadline {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        !fetch_lock.exists(),
+        "background fetch must release its lock"
+    );
 
     let cached_bin = plugin_data_dir.join("bin").join("ov-agy-v9.8.7");
     assert!(
@@ -1854,6 +1933,64 @@ async fn test_8_cold_start_concurrent_fetch_and_sha256_guard() {
         direct_fetch_out.status.success(),
         "fetch-binary.sh root plugin.json fallback failed: stderr={}",
         String::from_utf8_lossy(&direct_fetch_out.stderr)
+    );
+
+    // 5c. A cold PreToolUse must answer at once: agy fails the tool call when the hook times
+    //     out or prints no decision, and a download cannot fit in the hook budget.
+    let unreachable_data = temp_dir.path().join("plugin-data-unreachable");
+    let cold_root = fake_plugin_root.clone();
+    let cold_scripts = fake_scripts_dir.clone();
+    let cold_data = unreachable_data.clone();
+    let cold_home = home_dir.clone();
+    let (cold_out, cold_elapsed) = task::spawn_blocking(move || {
+        let started = std::time::Instant::now();
+        let mut child = Command::new(cold_scripts.join("ov-agy"))
+            .args(["hook", "pre-tool"])
+            .env("PLUGIN_ROOT", &cold_root)
+            .env("OPENVIKING_PLUGIN_DATA", &cold_data)
+            .env(
+                "OPENVIKING_RELEASE_BASE_URL",
+                "http://127.0.0.1:9/unreachable",
+            )
+            .env("HOME", &cold_home)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("cold pre-tool launcher must spawn");
+        child
+            .stdin
+            .take()
+            .expect("stdin must be piped")
+            .write_all(br#"{"toolCall":{"id":"1","name":"read_file","args":{"Path":"/tmp/x"}}}"#)
+            .expect("pre-tool stdin write must succeed");
+        let out = child.wait_with_output().expect("cold pre-tool must finish");
+        (out, started.elapsed())
+    })
+    .await
+    .expect("cold pre-tool task must join");
+    assert!(cold_out.status.success(), "cold pre-tool must exit 0");
+    assert_eq!(
+        String::from_utf8_lossy(&cold_out.stdout).trim(),
+        r#"{"decision":"ask"}"#,
+        "cold pre-tool must defer to the user's permission flow instead of blocking"
+    );
+    assert!(
+        cold_elapsed < Duration::from_secs(2),
+        "cold pre-tool must not wait for the download, took {cold_elapsed:?}"
+    );
+    let cold_lock = unreachable_data.join("locks").join("fetch-v9.8.7.lock");
+    let lock_deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while cold_lock.exists() && std::time::Instant::now() < lock_deadline {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        !cold_lock.exists(),
+        "a failed background fetch must release its lock so the next hook retries"
+    );
+    assert!(
+        !unreachable_data.join("bin").join("ov-agy-v9.8.7").exists(),
+        "an unreachable release must not leave a binary behind"
     );
 
     // 6. Verify SHA-256 mismatch aborts before placing any binary.
@@ -2339,7 +2476,10 @@ async fn capture_migrates_the_cursor_and_waits_for_finished_steps() {
         .map(|msg| msg.body["parts"][0]["text"].as_str().unwrap())
         .collect();
     assert_eq!(text, ["first", "finished answer"]);
-    assert_eq!(mock.committed_sessions.lock().unwrap().len(), 2);
+    assert!(
+        mock.committed_sessions.lock().unwrap().is_empty(),
+        "two short messages stay below the token threshold; the idle sweep commits them later"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2360,6 +2500,10 @@ async fn startup_profiles_indexes_and_archive_respect_auto_inject() {
                 ),
                 ("OPENVIKING_PEER_ID", "project"),
                 ("OPENVIKING_NO_AUTO_INJECT", disabled),
+                (
+                    "OPENVIKING_PLUGIN_DATA",
+                    paths.plugin_data.to_str().unwrap(),
+                ),
             ],
         );
         let body: Value = serde_json::from_str(&out.stdout).unwrap();
@@ -2370,18 +2514,28 @@ async fn startup_profiles_indexes_and_archive_respect_auto_inject() {
     };
     let enabled = run("0");
     for expected in [
-        "viking://~/memories/profile.md",
-        "viking://~/peers/project/memories/profile.md",
-        "viking://~/memories/entities/repo/format.md",
-        "Rust style fixture",
-        "rust-audit",
-        "archive of agy-resume",
+        "<openviking-context source=\"startup\">",
+        "<user-profile uri=\"viking://~/memories/profile.md\">",
+        "<user-profile uri=\"viking://~/peers/project/memories/profile.md\">",
+        "<available-memories>",
+        "  viking://~/memories/entities/",
+        "    - repo/format.md — Rust style fixture",
+        "<available-skills>",
+        "    - rust-audit — Audit Rust crates",
+        "    - deploy-runbook — Shared production rollout checklist.",
     ] {
-        assert!(enabled.contains(expected), "{expected}");
+        assert!(enabled.contains(expected), "{expected}\n{enabled}");
     }
     assert!(!enabled.contains("denied fixture"));
+    assert!(
+        !enabled.contains("archive of"),
+        "a new conversation has no archive, so SessionStart does not ask for one"
+    );
+    let audit = fs::read_to_string(paths.plugin_data.join("last-inject.md"))
+        .expect("the injected context is kept for audits");
+    assert!(audit.contains("source=startup") && audit.contains("repo/format.md"));
     let disabled = run("1");
-    assert!(disabled.contains("archive of agy-resume"));
+    assert!(disabled.contains("<openviking-session>"));
     for absent in ["profile.md", "Rust style fixture", "rust-audit"] {
         assert!(!disabled.contains(absent), "{absent}");
     }
@@ -2400,6 +2554,8 @@ async fn mcp_changed_roots_replace_the_stateful_upstream_session() {
         .env("HOME", temp.path())
         .env("PLUGIN_ROOT", temp.path())
         .env("OPENVIKING_CLI_CONFIG_FILE", paths.cli_conf)
+        // The proxy names the peer only for actor-scoped recall.
+        .env("OPENVIKING_RECALL_PEER_SCOPE", "actor")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .spawn()
@@ -2475,5 +2631,904 @@ async fn legacy_find_respects_scope_and_recovers_partial_results() {
     assert_eq!(hits.load(Ordering::SeqCst), 0);
     assert!(recall("all", "").stdout.contains("legacy note"));
     assert_eq!(hits.load(Ordering::SeqCst), 2);
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn gateway_html_200_is_queued_instead_of_counted_as_delivered() {
+    let mock_state = Arc::new(MockServerState::default());
+    mock_state
+        .gateway_html_messages
+        .store(true, Ordering::SeqCst);
+    let server = spawn_mock_ov_server(mock_state.clone()).await;
+    let base_url = format!("http://{}", server.addr);
+
+    let temp_dir = TempDir::new().unwrap();
+    let paths = setup_test_ovcli(temp_dir.path(), &base_url, "user-key-gateway");
+    let transcript_path = temp_dir.path().join("transcript.jsonl");
+    fs::write(
+        &transcript_path,
+        concat!(
+            r#"{"step_index":0,"source":"USER_EXPLICIT","type":"USER_INPUT","status":"DONE","content":"<USER_REQUEST>\nKeep the gateway turn.\n</USER_REQUEST>"}"#,
+            "\n",
+            r#"{"step_index":1,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","content":"Kept."}"#,
+            "\n"
+        ),
+    )
+    .unwrap();
+    let envs = vec![
+        ("HOME".to_string(), temp_dir.path().display().to_string()),
+        (
+            "OPENVIKING_HOME".to_string(),
+            paths.ov_home.display().to_string(),
+        ),
+        (
+            "OPENVIKING_PLUGIN_DATA".to_string(),
+            paths.plugin_data.display().to_string(),
+        ),
+        (
+            "OPENVIKING_CLI_CONFIG_FILE".to_string(),
+            paths.cli_conf.display().to_string(),
+        ),
+    ];
+    let run_worker = |envs: Vec<(String, String)>, transcript: String, cwd: String| {
+        task::spawn_blocking(move || {
+            let refs: Vec<(&str, &str)> =
+                envs.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+            run_hook_cmd(
+                &[
+                    "worker",
+                    "--conversation-id",
+                    "conv-gateway",
+                    "--transcript-path",
+                    &transcript,
+                    "--cwd",
+                    &cwd,
+                ],
+                "",
+                &refs,
+            )
+        })
+    };
+    let transcript = transcript_path.display().to_string();
+    let cwd = temp_dir.path().display().to_string();
+
+    let first = run_worker(envs.clone(), transcript.clone(), cwd.clone())
+        .await
+        .unwrap();
+    assert_eq!(first.exit_code, 0);
+    assert!(mock_state.captured_messages.lock().unwrap().is_empty());
+    let wal_raw = fs::read_to_string(active_wal_path(&paths.plugin_data))
+        .expect("an HTML 200 must leave the turns in the offline WAL");
+    assert!(wal_raw.contains("Keep the gateway turn."));
+    assert!(
+        mock_state.committed_sessions.lock().unwrap().is_empty(),
+        "nothing may be committed while writes are not reaching OpenViking"
+    );
+
+    mock_state
+        .gateway_html_messages
+        .store(false, Ordering::SeqCst);
+    let second = run_worker(envs, transcript, cwd).await.unwrap();
+    assert_eq!(second.exit_code, 0);
+    let delivered: Vec<String> = mock_state
+        .captured_messages
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|m| {
+            m.body["parts"][0]["text"]
+                .as_str()
+                .unwrap_or("")
+                .to_string()
+        })
+        .collect();
+    assert_eq!(
+        delivered,
+        vec!["Keep the gateway turn.".to_string(), "Kept.".to_string()],
+        "the queued turns must replay once the gateway passes requests through"
+    );
+}
+
+#[test]
+fn doctor_reports_agy_data_directories_and_foreign_queues() {
+    let temp = TempDir::new().unwrap();
+    let home = temp.path();
+    let agy_data = home.join(".gemini/antigravity-cli/plugin_data/openviking");
+    fs::create_dir_all(agy_data.join("state")).unwrap();
+    fs::create_dir_all(agy_data.join("wal/0123abcd")).unwrap();
+    fs::write(agy_data.join("state/conv-1.json"), "{}").unwrap();
+    fs::write(
+        agy_data.join("wal/0123abcd/pending.jsonl"),
+        "{\"op\":\"commit\"}\n{\"op\":\"commit\"}\n",
+    )
+    .unwrap();
+    fs::write(
+        agy_data.join("last-recall.json"),
+        json!({
+            "timestamp_ms": 1,
+            "conversation_id": "conv-1",
+            "ov_session_id": "agy-conv-1",
+            "peer_id": "",
+            "outcome": "failed",
+            "latency_ms": 3801,
+            "query_chars": 12,
+            "injected_chars": 0,
+            "error": "network or timeout error: operation timed out"
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let other_plugin = home.join(".gemini/antigravity-cli/plugin_data/swarm");
+    fs::create_dir_all(other_plugin.join("state")).unwrap();
+
+    let home_str = home.display().to_string();
+    let out = run_hook_cmd(
+        &["doctor", "--json", "--offline", "--cwd", &home_str],
+        "",
+        &[("HOME", &home_str), ("OPENVIKING_MEMORY_ENABLED", "1")],
+    );
+    assert_eq!(out.exit_code, 0, "doctor must exit 0: {}", out.stderr);
+    let report: Value = serde_json::from_str(out.stdout.trim()).unwrap();
+    let dirs = report["data_dirs"].as_array().unwrap();
+    let active = dirs.iter().find(|d| d["active"] == true).unwrap();
+    assert!(active["path"]
+        .as_str()
+        .unwrap()
+        .ends_with(".openviking/agy-plugin"));
+    let agy = dirs
+        .iter()
+        .find(|d| {
+            d["path"]
+                .as_str()
+                .unwrap()
+                .ends_with("antigravity-cli/plugin_data/openviking")
+        })
+        .expect("doctor must find the agy CLI data directory");
+    assert_eq!(agy["conversations"], 1);
+    assert_eq!(agy["wal_scopes"][0]["entries"], 2);
+    assert_eq!(agy["wal_scopes"][0]["current_identity"], false);
+    assert_eq!(agy["last_recall"]["outcome"], "failed");
+    assert!(
+        dirs.iter()
+            .all(|d| !d["path"].as_str().unwrap().ends_with("plugin_data/swarm")),
+        "other plugins' data directories must be ignored"
+    );
+    let warnings: Vec<&str> = report["warnings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    assert!(warnings.iter().any(|w| w.contains("2 queued turn(s)")));
+    assert!(warnings
+        .iter()
+        .any(|w| w.contains("agy last wrote plugin state to")));
+}
+
+fn worker_envs(temp: &Path, paths: &TestConfigPaths) -> Vec<(String, String)> {
+    vec![
+        ("HOME".to_string(), temp.display().to_string()),
+        (
+            "OPENVIKING_HOME".to_string(),
+            paths.ov_home.display().to_string(),
+        ),
+        (
+            "OPENVIKING_PLUGIN_DATA".to_string(),
+            paths.plugin_data.display().to_string(),
+        ),
+        (
+            "OPENVIKING_CLI_CONFIG_FILE".to_string(),
+            paths.cli_conf.display().to_string(),
+        ),
+    ]
+}
+
+fn run_with(args: &[&str], envs: &[(String, String)]) -> CommandOutput {
+    let refs: Vec<(&str, &str)> = envs.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    run_hook_cmd(args, "", &refs)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn captures_tool_calls_in_batches_and_commits_at_the_token_threshold() {
+    let mock = Arc::new(MockServerState::default());
+    mock.batch_enabled.store(true, Ordering::SeqCst);
+    mock.session_meta_enabled.store(true, Ordering::SeqCst);
+    mock.pending_tokens.store(100, Ordering::SeqCst);
+    let server = spawn_mock_ov_server(mock.clone()).await;
+    let temp = TempDir::new().unwrap();
+    let paths = setup_test_ovcli(temp.path(), &format!("http://{}", server.addr), "key");
+    let transcript = temp.path().join("transcript.jsonl");
+    let lines = [
+        json!({"step_index":0,"source":"USER_EXPLICIT","type":"USER_INPUT","status":"DONE","content":"Why does the build fail?"}),
+        json!({"step_index":1,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","tool_calls":[
+            {"name":"read_file","args":{"Path":"/repo/build.rs"}},
+            {"name":"call_mcp_tool","args":{"ServerName":"openviking_openviking","ToolName":"find","Arguments":{"query":"build failure"}}}
+        ]}),
+        json!({"step_index":2,"type":"GENERIC","status":"DONE","content":"Created At: 2026-11-24T22:37:06+08:00\nCompleted At: 2026-11-24T22:37:07+08:00\nfn main() {}"}),
+        json!({"step_index":3,"type":"GENERIC","status":"DONE","content":"Created At: x\nCompleted At: y\nresult: 1 hit"}),
+        json!({"step_index":4,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","content":"build.rs is empty, so the linker step is missing."}),
+    ];
+    let mut body = String::new();
+    for line in &lines {
+        body.push_str(&line.to_string());
+        body.push('\n');
+    }
+    fs::write(&transcript, &body).unwrap();
+    let envs = worker_envs(temp.path(), &paths);
+    let tp = transcript.display().to_string();
+    let cwd = temp.path().display().to_string();
+    let args = [
+        "worker",
+        "--conversation-id",
+        "tools",
+        "--transcript-path",
+        &tp,
+        "--cwd",
+        &cwd,
+    ];
+
+    assert_eq!(run_with(&args, &envs).exit_code, 0);
+    assert_eq!(
+        mock.batch_calls.load(Ordering::SeqCst),
+        1,
+        "one batch per Stop"
+    );
+    let messages: Vec<Value> = mock
+        .captured_messages
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|m| m.body.clone())
+        .collect();
+    assert_eq!(messages.len(), 3, "{messages:#?}");
+    let tools = &messages[1]["parts"];
+    assert_eq!(messages[1]["role"], "assistant");
+    assert_eq!(tools[0]["type"], "tool");
+    assert_eq!(tools[0]["tool_id"], "agy-1-0");
+    assert_eq!(tools[0]["tool_name"], "read_file");
+    assert_eq!(tools[0]["tool_status"], "completed");
+    assert_eq!(tools[0]["tool_input"], json!({"Path":"/repo/build.rs"}));
+    assert_eq!(tools[0]["tool_output"], "fn main() {}");
+    assert_eq!(
+        tools[1]["tool_name"], "find",
+        "OpenViking's own tools keep bare names"
+    );
+    assert_eq!(tools[1]["tool_input"], json!({"query":"build failure"}));
+    assert_eq!(
+        messages[2]["parts"][0]["text"],
+        "build.rs is empty, so the linker step is missing."
+    );
+    assert!(
+        mock.committed_sessions.lock().unwrap().is_empty(),
+        "100 pending tokens stay below the 20000 threshold"
+    );
+
+    mock.pending_tokens.store(25_000, Ordering::SeqCst);
+    for line in [
+        json!({"step_index":5,"source":"USER_EXPLICIT","type":"USER_INPUT","status":"DONE","content":"Thanks, fix it"}),
+        json!({"step_index":6,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","content":"Fixed."}),
+    ] {
+        body.push_str(&line.to_string());
+        body.push('\n');
+    }
+    fs::write(&transcript, &body).unwrap();
+    assert_eq!(run_with(&args, &envs).exit_code, 0);
+    assert_eq!(*mock.committed_sessions.lock().unwrap(), ["agy-tools"]);
+    let state: Value =
+        serde_json::from_slice(&fs::read(paths.plugin_data.join("state/tools.json")).unwrap())
+            .unwrap();
+    assert_eq!(state["uncommitted_turns"], 0);
+    assert_eq!(state["transcript_path"], tp);
+    assert_eq!(state["workspace"], cwd);
+    assert!(state["updated_at_ms"].as_u64().is_some());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn idle_sweep_commits_idle_conversations_and_retires_old_state() {
+    let mock = Arc::new(MockServerState::default());
+    let server = spawn_mock_ov_server(mock.clone()).await;
+    let temp = TempDir::new().unwrap();
+    let paths = setup_test_ovcli(temp.path(), &format!("http://{}", server.addr), "key");
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    let state_dir = paths.plugin_data.join("state");
+    let locks_dir = paths.plugin_data.join("locks");
+    fs::create_dir_all(&state_dir).unwrap();
+    fs::create_dir_all(&locks_dir).unwrap();
+
+    let idle_transcript = temp.path().join("idle-transcript.jsonl");
+    fs::write(
+        &idle_transcript,
+        format!(
+            "{}\n",
+            json!({"step_index":0,"source":"USER_EXPLICIT","type":"USER_INPUT","status":"DONE","content":"tail turn the Stop worker never sent"})
+        ),
+    )
+    .unwrap();
+    let write_state = |id: &str, state: Value| {
+        fs::write(state_dir.join(format!("{id}.json")), state.to_string()).unwrap();
+    };
+    let hour = 60 * 60 * 1000;
+    write_state(
+        "idle-old",
+        json!({
+            "conversation_id": "idle-old", "ov_session_id": "agy-idle-old",
+            "uncommitted_turns": 2, "updated_at_ms": now - 2 * hour,
+            "transcript_path": idle_transcript.display().to_string(),
+            "workspace": temp.path().display().to_string()
+        }),
+    );
+    write_state(
+        "active",
+        json!({
+            "conversation_id": "active", "ov_session_id": "agy-active",
+            "uncommitted_turns": 1, "updated_at_ms": now - 60_000
+        }),
+    );
+    write_state(
+        "current",
+        json!({
+            "conversation_id": "current", "ov_session_id": "agy-current",
+            "uncommitted_turns": 1, "updated_at_ms": now - 2 * hour
+        }),
+    );
+    write_state(
+        "ancient",
+        json!({
+            "conversation_id": "ancient", "ov_session_id": "agy-ancient",
+            "uncommitted_turns": 0, "updated_at_ms": now - 40 * 24 * hour
+        }),
+    );
+    let forty_days_ago = std::time::SystemTime::now() - Duration::from_hours(40 * 24);
+    for name in ["ancient.lock", "orphan.lock", "wal-shared.lock"] {
+        let file = fs::File::create(locks_dir.join(name)).unwrap();
+        file.set_modified(forty_days_ago).unwrap();
+    }
+
+    let envs = worker_envs(temp.path(), &paths);
+    let cwd = temp.path().display().to_string();
+    let out = run_with(&["sweep", "--exclude", "current", "--cwd", &cwd], &envs);
+    assert_eq!(out.exit_code, 0, "{}", out.stderr);
+
+    assert_eq!(
+        *mock.committed_sessions.lock().unwrap(),
+        ["agy-idle-old"],
+        "only the idle conversation is committed; the active one and the starting one stay live"
+    );
+    let captured = mock.captured_messages.lock().unwrap();
+    assert_eq!(captured.len(), 1);
+    assert_eq!(captured[0].session_id, "agy-idle-old");
+    assert_eq!(
+        captured[0].body["parts"][0]["text"],
+        "tail turn the Stop worker never sent"
+    );
+    drop(captured);
+    assert!(
+        !state_dir.join("ancient.json").exists(),
+        "committed state is retired after 30 days"
+    );
+    assert!(!locks_dir.join("ancient.lock").exists());
+    assert!(!locks_dir.join("orphan.lock").exists());
+    assert!(
+        locks_dir.join("wal-shared.lock").exists(),
+        "shared locks are never removed"
+    );
+    let idle_state: Value =
+        serde_json::from_slice(&fs::read(state_dir.join("idle-old.json")).unwrap()).unwrap();
+    assert_eq!(idle_state["uncommitted_turns"], 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn recall_turns_query_expansion_off_when_the_budget_is_short() {
+    let mock = Arc::new(MockServerState::default());
+    let server = spawn_mock_ov_server(mock.clone()).await;
+    let temp = TempDir::new().unwrap();
+    let paths = setup_test_ovcli(temp.path(), &format!("http://{}", server.addr), "key");
+    let expansion = |conversation: &str, extra: &[(&str, &str)]| {
+        let input = json!({"conversationId": conversation, "cwd": temp.path(),
+            "invocationNum": 0, "lastUserInput": "How do we deploy the gateway?"});
+        let mut envs = vec![
+            ("HOME", temp.path().to_str().unwrap()),
+            (
+                "OPENVIKING_CLI_CONFIG_FILE",
+                paths.cli_conf.to_str().unwrap(),
+            ),
+            (
+                "OPENVIKING_PLUGIN_DATA",
+                paths.plugin_data.to_str().unwrap(),
+            ),
+        ];
+        envs.extend_from_slice(extra);
+        let out = run_hook_cmd(&["hook", "pre-invocation"], &input.to_string(), &envs);
+        assert_eq!(out.exit_code, 0);
+        mock.last_search_body.lock().unwrap().clone().unwrap()["query_expansion"].clone()
+    };
+    assert_eq!(expansion("short", &[]), "off");
+    assert_eq!(
+        expansion("long", &[("OPENVIKING_RECALL_TIMEOUT_MS", "15000")]),
+        Value::Null,
+        "a long budget leaves the server default in place"
+    );
+    assert_eq!(
+        expansion("explicit", &[("OPENVIKING_RECALL_QUERY_EXPANSION", "auto")]),
+        "auto"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn compaction_reinjects_startup_context_once_and_commits() {
+    let mock = Arc::new(MockServerState::default());
+    let server = spawn_mock_ov_server(mock.clone()).await;
+    let temp = TempDir::new().unwrap();
+    let paths = setup_test_ovcli(temp.path(), &format!("http://{}", server.addr), "key");
+    let transcript = temp.path().join("transcript.jsonl");
+    let lines = [
+        json!({"step_index":0,"source":"USER_EXPLICIT","type":"USER_INPUT","status":"DONE","content":"Plan the migration"}),
+        json!({"step_index":1,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","content":"Here is the plan."}),
+        json!({"step_index":2,"source":"SYSTEM","type":"CHECKPOINT","status":"DONE","content":"# Resuming from a compaction\nsummary"}),
+    ];
+    let mut body = String::new();
+    for line in &lines {
+        body.push_str(&line.to_string());
+        body.push('\n');
+    }
+    fs::write(&transcript, body).unwrap();
+    let invoke = |n: u64, archive: &str| {
+        let input = json!({"conversationId":"compacted","cwd":temp.path(),"transcriptPath":transcript,
+            "invocationNum": n, "lastUserInput": "continue"});
+        let out = run_hook_cmd(
+            &["hook", "pre-invocation"],
+            &input.to_string(),
+            &[
+                ("HOME", temp.path().to_str().unwrap()),
+                (
+                    "OPENVIKING_CLI_CONFIG_FILE",
+                    paths.cli_conf.to_str().unwrap(),
+                ),
+                (
+                    "OPENVIKING_PLUGIN_DATA",
+                    paths.plugin_data.to_str().unwrap(),
+                ),
+                ("OPENVIKING_RESUME_ARCHIVE_INJECT", archive),
+            ],
+        );
+        assert_eq!(out.exit_code, 0);
+        out.stdout
+    };
+    // A Stop worker still owns the conversation when the compaction is noticed; the commit
+    // must wait for it instead of being dropped.
+    let locks = paths.plugin_data.join("locks");
+    fs::create_dir_all(&locks).unwrap();
+    let held = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(locks.join("compacted.lock"))
+        .unwrap();
+    held.lock().unwrap();
+    let first = invoke(2, "1");
+    assert!(first.contains("source=\\\"compaction\\\""), "{first}");
+    assert!(first.contains("viking://~/memories/profile.md"));
+    assert!(first.contains("<session-archive session=\\\"agy-compacted\\\">"));
+    assert!(first.contains("archive of agy-compacted"));
+    assert_eq!(
+        invoke(3, "1").trim(),
+        "{}",
+        "one checkpoint is answered once"
+    );
+
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert!(
+        mock.committed_sessions.lock().unwrap().is_empty(),
+        "nothing is committed while the lock is held"
+    );
+    drop(held);
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while mock.committed_sessions.lock().unwrap().is_empty() && std::time::Instant::now() < deadline
+    {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(
+        *mock.committed_sessions.lock().unwrap(),
+        ["agy-compacted"],
+        "autoCommitOnCompact captures and commits the conversation once the lock is free"
+    );
+    let texts: Vec<String> = mock
+        .captured_messages
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|m| {
+            m.body["parts"][0]["text"]
+                .as_str()
+                .unwrap_or("")
+                .to_string()
+        })
+        .collect();
+    assert_eq!(texts, ["Plan the migration", "Here is the plan."]);
+}
+
+/// Requests are forwarded concurrently, and a 401 after `ov config switch` reconnects once
+/// with the credentials now on disk; an unchanged rejection still reaches the host.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mcp_proxy_runs_requests_concurrently_and_reloads_switched_credentials() {
+    #[derive(Default)]
+    struct Upstream {
+        accepted: Mutex<String>,
+        initializes: AtomicUsize,
+        session: Mutex<String>,
+    }
+    let upstream = Arc::new(Upstream::default());
+    *upstream.accepted.lock().unwrap() = "Bearer first-key".to_string();
+    let router = Router::new()
+        .route(
+            "/mcp",
+            post(
+                |State(up): State<Arc<Upstream>>, headers: HeaderMap, Json(body): Json<Value>| async move {
+                    let header = |name: &str| {
+                        headers
+                            .get(name)
+                            .and_then(|v| v.to_str().ok())
+                            .unwrap_or("")
+                            .to_string()
+                    };
+                    let authorized = header("authorization") == *up.accepted.lock().unwrap();
+                    if !authorized {
+                        return StatusCode::UNAUTHORIZED.into_response();
+                    }
+                    let id = body["id"].clone();
+                    if body["method"] == "initialize" {
+                        let sid = format!("s-{}", up.initializes.fetch_add(1, Ordering::SeqCst) + 1);
+                        up.session.lock().unwrap().clone_from(&sid);
+                        let mut resp = Json(json!({"jsonrpc":"2.0","id":id,"result":{"protocolVersion":"2025-03-26","capabilities":{}}}))
+                            .into_response();
+                        resp.headers_mut()
+                            .insert("mcp-session-id", HeaderValue::from_str(&sid).unwrap());
+                        return resp;
+                    }
+                    let sid = header("mcp-session-id");
+                    let current = sid == *up.session.lock().unwrap();
+                    if !current {
+                        return StatusCode::NOT_FOUND.into_response();
+                    }
+                    if body.get("id").is_none() {
+                        return StatusCode::ACCEPTED.into_response();
+                    }
+                    if body["params"]["name"] == "slow" {
+                        tokio::time::sleep(Duration::from_millis(1500)).await;
+                    }
+                    Json(json!({"jsonrpc":"2.0","id":id,"result":{"session":sid}})).into_response()
+                },
+            )
+            .delete(|| async { StatusCode::NO_CONTENT }),
+        )
+        .with_state(upstream.clone());
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let _ = axum::serve(listener, router).await;
+    });
+
+    let temp = TempDir::new().unwrap();
+    let base_url = format!("http://{addr}");
+    let paths = setup_test_ovcli(temp.path(), &base_url, "first-key");
+    let up = upstream.clone();
+    task::spawn_blocking(move || {
+        let mut child = Command::new(ov_agy_bin())
+            .arg("mcp-proxy")
+            .env("HOME", temp.path())
+            .env("OPENVIKING_HOME", &paths.ov_home)
+            .env("OPENVIKING_PLUGIN_DATA", &paths.plugin_data)
+            .env("OPENVIKING_CLI_CONFIG_FILE", &paths.cli_conf)
+            .env("NO_PROXY", "127.0.0.1,localhost")
+            .env("no_proxy", "127.0.0.1,localhost")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut input = child.stdin.take().unwrap();
+        let mut output = BufReader::new(child.stdout.take().unwrap()).lines();
+        let mut send = |frame: Value| {
+            writeln!(input, "{frame}").unwrap();
+            input.flush().unwrap();
+        };
+        let mut read = || serde_json::from_str::<Value>(&output.next().unwrap().unwrap()).unwrap();
+        let call = |id: &str, name: &str| {
+            json!({"jsonrpc":"2.0","id":id,"method":"tools/call","params":{"name":name,"arguments":{}}})
+        };
+
+        send(json!({"jsonrpc":"2.0","id":0,"method":"initialize","params":{"capabilities":{}}}));
+        assert_eq!(read()["id"], 0);
+        send(json!({"jsonrpc":"2.0","method":"notifications/initialized"}));
+        send(call("slow", "slow"));
+        send(call("fast", "fast"));
+        assert_eq!(read()["id"], "fast", "a slow call must not hold up the next one");
+        assert_eq!(read()["id"], "slow");
+
+        // `ov config switch` rewrites ovcli.conf; the server now accepts only the new key.
+        *up.accepted.lock().unwrap() = "Bearer second-key-longer".to_string();
+        fs::write(
+            &paths.cli_conf,
+            json!({"url": base_url, "api_key": "second-key-longer", "plugin": {"antigravity": {"enabled": true}}}).to_string(),
+        )
+        .unwrap();
+        send(call("after-switch", "fast"));
+        let reply = read();
+        assert_eq!(reply["id"], "after-switch");
+        assert_eq!(reply["result"]["session"], "s-2", "{reply}");
+        assert_eq!(up.initializes.load(Ordering::SeqCst), 2);
+
+        // Nothing changed on disk: the rejection is reported, not retried.
+        *up.accepted.lock().unwrap() = "Bearer nobody".to_string();
+        send(call("denied", "fast"));
+        let denied = read();
+        assert_eq!(denied["id"], "denied");
+        assert_eq!(denied["error"]["code"], -32001);
+        assert!(denied["error"]["message"].as_str().unwrap().contains("401"));
+        assert_eq!(up.initializes.load(Ordering::SeqCst), 2);
+
+        drop(input);
+        assert!(child.wait().unwrap().success());
+    })
+    .await
+    .unwrap();
+    server.abort();
+}
+
+/// `setup` checks the key against the server, then merges it into `ovcli.conf` with a 0600
+/// backup of the old file; `doctor` then passes against that server, and fails (exit 1, human
+/// output) once the server is gone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn setup_writes_verified_credentials_and_doctor_reports_the_server() {
+    let state = Arc::new(MockServerState::default());
+    let server = spawn_mock_ov_server(state.clone()).await;
+    let base_url = format!("http://{}", server.addr);
+    let temp = TempDir::new().unwrap();
+    let paths = setup_test_ovcli(temp.path(), "http://old.invalid:1933", "old-key");
+    fs::write(
+        &paths.cli_conf,
+        json!({"url": "http://old.invalid:1933", "api_key": "old-key", "plugin": {"antigravity": {"recall": {"limit": 4}}}}).to_string(),
+    )
+    .unwrap();
+    let home = temp.path().display().to_string();
+    let ov_home = paths.ov_home.display().to_string();
+    let cli_conf = paths.cli_conf.display().to_string();
+    let data = paths.plugin_data.display().to_string();
+    let envs = [
+        ("HOME", home.as_str()),
+        ("OPENVIKING_HOME", ov_home.as_str()),
+        ("OPENVIKING_CLI_CONFIG_FILE", cli_conf.as_str()),
+        ("OPENVIKING_PLUGIN_DATA", data.as_str()),
+        ("NO_PROXY", "127.0.0.1,localhost"),
+        ("no_proxy", "127.0.0.1,localhost"),
+    ];
+
+    // The mock serves from the runtime's worker threads while these calls block.
+    let out = run_hook_cmd(
+        &["setup", "--url", &base_url, "--api-key-stdin", "--yes"],
+        "fresh-user-key-0123456789\n",
+        &envs,
+    );
+    assert_eq!(out.exit_code, 0, "setup failed: {}", out.stderr);
+    assert!(
+        !out.stderr.contains("fresh-user-key"),
+        "setup must not echo the key"
+    );
+    let written: Value =
+        serde_json::from_str(&fs::read_to_string(&paths.cli_conf).unwrap()).unwrap();
+    assert_eq!(written["url"], base_url);
+    assert_eq!(written["api_key"], "fresh-user-key-0123456789");
+    assert_eq!(
+        written["plugin"]["antigravity"]["recall"]["limit"], 4,
+        "other settings survive"
+    );
+    let backups: Vec<PathBuf> = fs::read_dir(&paths.ov_home)
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .filter(|p| {
+            p.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("ovcli.conf.bak-")
+        })
+        .collect();
+    assert_eq!(backups.len(), 1);
+    assert!(fs::read_to_string(&backups[0]).unwrap().contains("old-key"));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        for file in [&paths.cli_conf, &backups[0]] {
+            let mode = fs::metadata(file).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "{} must be private", file.display());
+        }
+    }
+
+    let report = run_hook_cmd(&["doctor", "--json"], "", &envs);
+    assert_eq!(report.exit_code, 0, "{}", report.stderr);
+    let doc: Value = serde_json::from_str(report.stdout.trim()).unwrap();
+    assert_eq!(doc["health_ok"], true, "{doc:#}");
+    assert_eq!(doc["mcp_tool_count"], 2);
+    assert_eq!(doc["ok"], true, "{doc:#}");
+    let titles: Vec<String> = doc["sections"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|s| s["findings"].as_array().unwrap().clone())
+        .map(|f| f["title"].as_str().unwrap().to_string())
+        .collect();
+    assert!(
+        titles
+            .iter()
+            .any(|t| t.starts_with("MCP tools missing: find, list, tree, grep, glob")),
+        "{titles:?}"
+    );
+    assert!(
+        !report.stdout.contains("fresh-user-key-0123456789"),
+        "doctor must mask the key"
+    );
+
+    drop(server);
+    fs::write(
+        &paths.cli_conf,
+        json!({"url": "http://127.0.0.1:9", "api_key": "fresh-user-key-0123456789"}).to_string(),
+    )
+    .unwrap();
+    let human = run_hook_cmd(&["doctor", "--timeout-ms", "500"], "", &envs);
+    assert_eq!(
+        human.exit_code, 1,
+        "a failed check must exit 1:\n{}",
+        human.stdout
+    );
+    assert!(
+        human.stdout.contains("server unreachable"),
+        "{}",
+        human.stdout
+    );
+}
+
+/// A server behind a private CA is rejected on the bundled roots alone, and trusted through
+/// `OPENVIKING_CA_CERTS` or through a trust store that `SSL_CERT_FILE` names, which the client
+/// turns to after the bundled roots fail. `doctor` names the cause and the fix.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn private_ca_is_trusted_through_the_ca_bundle_or_the_trust_store() {
+    use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, KeyPair, KeyUsagePurpose};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio_rustls::rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
+
+    let ca_key = KeyPair::generate().unwrap();
+    let mut ca_params = CertificateParams::new(Vec::<String>::new()).unwrap();
+    ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    ca_params
+        .distinguished_name
+        .push(DnType::CommonName, "ov-agy test CA");
+    ca_params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+    let ca_cert = ca_params.self_signed(&ca_key).unwrap();
+    let server_key = KeyPair::generate().unwrap();
+    let server_cert =
+        CertificateParams::new(vec!["localhost".to_string(), "127.0.0.1".to_string()])
+            .unwrap()
+            .signed_by(&server_key, &ca_cert, &ca_key)
+            .unwrap();
+    let tls_config = tokio_rustls::rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(
+            vec![server_cert.der().clone()],
+            PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(server_key.serialize_der())),
+        )
+        .unwrap();
+    let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(tls_config));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = tokio::spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            let acceptor = acceptor.clone();
+            tokio::spawn(async move {
+                let Ok(mut tls) = acceptor.accept(stream).await else {
+                    return;
+                };
+                let mut request = Vec::new();
+                let mut buf = [0_u8; 4096];
+                while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match tls.read(&mut buf).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => request.extend_from_slice(&buf[..n]),
+                    }
+                }
+                let (status, body) = if request.starts_with(b"GET /health") {
+                    (
+                        "200 OK",
+                        r#"{"status":"ok","healthy":true,"version":"tls-test","auth_mode":"api_key","account_id":"acme","user_id":"alice","role":"user"}"#,
+                    )
+                } else {
+                    ("404 Not Found", r#"{"status":"error"}"#)
+                };
+                let reply = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = tls.write_all(reply.as_bytes()).await;
+                let _ = tls.shutdown().await;
+            });
+        }
+    });
+
+    let temp = TempDir::new().unwrap();
+    let ca_pem = temp.path().join("ca.pem");
+    fs::write(&ca_pem, ca_cert.pem()).unwrap();
+    let ca = ca_pem.display().to_string();
+    let home = temp.path().display().to_string();
+    let data = temp.path().join("data").display().to_string();
+    let url = format!("https://127.0.0.1:{port}");
+    let base = [
+        ("HOME", home.as_str()),
+        ("OPENVIKING_CREDENTIAL_SOURCE", "env"),
+        ("OPENVIKING_URL", url.as_str()),
+        ("OPENVIKING_API_KEY", "tls-key"),
+        ("OPENVIKING_MEMORY_ENABLED", "1"),
+        ("OPENVIKING_PLUGIN_DATA", data.as_str()),
+        ("NO_PROXY", "127.0.0.1,localhost"),
+        ("no_proxy", "127.0.0.1,localhost"),
+    ];
+    let run = |args: &[&str], extra: &[(&str, &str)]| {
+        let envs: Vec<(&str, &str)> = base.iter().chain(extra).copied().collect();
+        let out = run_hook_cmd(args, "", &envs);
+        serde_json::from_str::<Value>(out.stdout.trim())
+            .unwrap_or_else(|err| panic!("{err}: {}\n{}", out.stdout, out.stderr))
+    };
+    let findings = |report: &Value| -> Vec<Value> {
+        report["sections"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|s| s["findings"].as_array().unwrap().clone())
+            .collect()
+    };
+
+    // Neither the bundled roots nor this machine's store know the test CA.
+    let rejected = run(&["status", "--json"], &[]);
+    assert_eq!(rejected["server"]["reachable"], false, "{rejected}");
+    let trusted = run(&["status", "--json"], &[("OPENVIKING_CA_CERTS", &ca)]);
+    assert_eq!(trusted["server"]["reachable"], true, "{trusted}");
+    assert_eq!(trusted["server"]["user"], "alice");
+    let via_store = run(&["status", "--json"], &[("SSL_CERT_FILE", &ca)]);
+    assert_eq!(via_store["server"]["reachable"], true, "{via_store}");
+
+    let doctor = ["doctor", "--json", "--timeout-ms", "2000"];
+    let report = run(&doctor, &[]);
+    assert_eq!(report["health_ok"], false);
+    let unreachable = findings(&report)
+        .into_iter()
+        .find(|f| {
+            f["title"]
+                .as_str()
+                .unwrap()
+                .starts_with("server unreachable")
+        })
+        .expect("the TLS failure must be reported");
+    assert!(
+        unreachable["detail"].as_str().unwrap().starts_with("tls:"),
+        "{unreachable}"
+    );
+    assert!(unreachable["fix"]
+        .as_str()
+        .unwrap()
+        .contains("OPENVIKING_CA_CERTS"));
+
+    let report = run(&doctor, &[("OPENVIKING_CA_CERTS", &ca)]);
+    assert_eq!(report["health_ok"], true, "{report:#}");
+    assert!(findings(&report).iter().any(|f| f["title"]
+        .as_str()
+        .unwrap()
+        .ends_with(&format!("+ 1 from {ca}"))));
+
+    let report = run(&doctor, &[("OPENVIKING_CA_CERTS", "/missing/ca.pem")]);
+    assert!(findings(&report)
+        .iter()
+        .any(|f| f["level"] == "fail" && f["title"] == "the extra CA bundle cannot be used"));
     server.abort();
 }

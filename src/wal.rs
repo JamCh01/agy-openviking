@@ -2,7 +2,7 @@
 
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -25,7 +25,7 @@ pub enum WalOp {
 }
 
 /// Single JSONL record in `wal/<scope>/pending.jsonl`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WalEntry {
     pub op: WalOp,
     pub session_id: String,
@@ -36,6 +36,14 @@ pub struct WalEntry {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub peer_id: Option<String>,
     pub created_at_ms: u64,
+    /// Replay passes that failed on this entry while it was at the head of the queue.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub retries: u32,
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_zero(value: &u32) -> bool {
+    *value == 0
 }
 
 impl WalEntry {
@@ -49,6 +57,7 @@ impl WalEntry {
             parts: req.parts.clone(),
             peer_id: req.peer_id.clone(),
             created_at_ms: config::now_epoch_ms(),
+            retries: 0,
         }
     }
 
@@ -62,6 +71,7 @@ impl WalEntry {
             parts: Vec::new(),
             peer_id: None,
             created_at_ms: config::now_epoch_ms(),
+            retries: 0,
         }
     }
 }
@@ -83,9 +93,72 @@ pub struct ReplayReport {
 
 /// File-locked offline queue manager for `wal/<scope>/pending.jsonl`.
 pub struct WalStore {
+    scope: String,
+    ttl_ms: u64,
+    max_retries: u32,
     wal_path: PathBuf,
     lock_path: PathBuf,
     replay_lock_path: PathBuf,
+}
+
+/// Queue held under one identity scope of a data directory.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScopeQueue {
+    pub scope: String,
+    pub stats: WalStats,
+    pub oldest_created_at_ms: Option<u64>,
+}
+
+/// Every offline queue in `<data_dir>/wal`, including the unscoped legacy file.
+#[must_use]
+pub fn survey_queues(data_dir: &Path) -> (Vec<ScopeQueue>, WalStats) {
+    let wal_root = data_dir.join("wal");
+    let legacy = count_lines(&wal_root.join("pending.jsonl"));
+    let mut scopes: Vec<ScopeQueue> = fs::read_dir(&wal_root)
+        .into_iter()
+        .flatten()
+        .filter_map(Result::ok)
+        .filter(|entry| entry.path().is_dir())
+        .filter_map(|entry| {
+            let path = entry.path().join("pending.jsonl");
+            let stats = count_lines(&path);
+            (stats.entry_count > 0).then(|| ScopeQueue {
+                scope: entry.file_name().to_string_lossy().into_owned(),
+                stats,
+                oldest_created_at_ms: oldest_entry_ms(&path),
+            })
+        })
+        .collect();
+    scopes.sort_by(|a, b| a.scope.cmp(&b.scope));
+    (scopes, legacy)
+}
+
+fn oldest_entry_ms(path: &Path) -> Option<u64> {
+    let file = File::open(path).ok()?;
+    BufReader::new(file)
+        .lines()
+        .map_while(Result::ok)
+        .find(|line| !line.trim().is_empty())
+        .and_then(|line| serde_json::from_str::<WalEntry>(&line).ok())
+        .map(|entry| entry.created_at_ms)
+}
+
+fn count_lines(path: &Path) -> WalStats {
+    let Ok(meta) = fs::metadata(path) else {
+        return WalStats::default();
+    };
+    let byte_size = meta.len();
+    let entry_count = File::open(path).map_or(0, |file| {
+        BufReader::new(file)
+            .lines()
+            .map_while(Result::ok)
+            .filter(|line| !line.trim().is_empty())
+            .count()
+    });
+    WalStats {
+        entry_count,
+        byte_size,
+    }
 }
 
 impl WalStore {
@@ -110,36 +183,22 @@ impl WalStore {
             wal_path: cfg.state_dir.join("wal").join(&scope).join("pending.jsonl"),
             lock_path: cfg.lock_file_path(&format!("wal-{scope}")),
             replay_lock_path: cfg.lock_file_path(&format!("wal-replay-{scope}")),
+            scope,
+            ttl_ms: cfg.pending_ttl_days * 24 * 60 * 60 * 1000,
+            max_retries: cfg.pending_max_retries,
         }
+    }
+
+    /// Identity scope (hash of URL, account, user, key and peer) this store reads and writes.
+    #[must_use]
+    pub fn scope(&self) -> &str {
+        &self.scope
     }
 
     /// Returns the number of queued entries and file size in bytes.
     #[must_use]
     pub fn stats(&self) -> WalStats {
-        let Ok(meta) = fs::metadata(&self.wal_path) else {
-            return WalStats::default();
-        };
-        let byte_size = meta.len();
-        if byte_size == 0 {
-            return WalStats::default();
-        }
-        let Ok(file) = File::open(&self.wal_path) else {
-            return WalStats {
-                entry_count: 0,
-                byte_size,
-            };
-        };
-        let lines = BufReader::new(file).lines().map_while(Result::ok);
-        let mut entry_count = 0usize;
-        for line in lines {
-            if !line.trim().is_empty() {
-                entry_count += 1;
-            }
-        }
-        WalStats {
-            entry_count,
-            byte_size,
-        }
+        count_lines(&self.wal_path)
     }
 
     /// Appends `entries` to `wal/<scope>/pending.jsonl` under an exclusive lock, enforcing `MAX_WAL_BYTES`.
@@ -195,8 +254,15 @@ impl WalStore {
 
         let mut replayed = 0usize;
         let mut first_unsent_idx: Option<usize> = None;
+        let now = config::now_epoch_ms();
 
-        for (idx, entry) in parsed_entries.iter().enumerate() {
+        for (idx, entry) in parsed_entries.iter_mut().enumerate() {
+            // A queue that outlives `OPENVIKING_PENDING_TTL_DAYS` no longer describes the
+            // current conversation; its turns are dropped rather than replayed weeks later.
+            if now.saturating_sub(entry.created_at_ms) > self.ttl_ms {
+                dropped += 1;
+                continue;
+            }
             let send_res = match entry.op {
                 WalOp::AddMessage => {
                     let req = OvAddMessageRequest {
@@ -214,6 +280,11 @@ impl WalStore {
                     replayed += 1;
                 }
                 Err(err) if err.should_queue_to_wal() => {
+                    entry.retries += 1;
+                    if entry.retries >= self.max_retries {
+                        dropped += 1;
+                        continue;
+                    }
                     first_unsent_idx = Some(idx);
                     break;
                 }

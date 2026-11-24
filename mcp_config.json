@@ -1,7 +1,7 @@
 {
   "mcpServers": {
     "openviking": {
-      "command": "/bin/sh",
+      "command": "sh",
       "args": [
         "${PLUGIN_ROOT}/scripts/ov-agy",
         "mcp-proxy"

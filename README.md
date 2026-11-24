@@ -42,13 +42,16 @@
 
 | Component | Entrypoint / File | Responsibility |
 | :--- | :--- | :--- |
-| **MCP Proxy** | `ov-agy mcp-proxy` (`mcp_config.json`) | Negotiates the workspace with agy using MCP `roots/list` and forwards JSON/SSE requests to `{base_url}/mcp`. An expired stateful session is reinitialized on HTTP 404. |
-| **`SessionStart` Hook** | `./scripts/ov-agy hook session-start` | Checks connectivity and injects the user and project profiles, preference and entity indexes, skill catalog, and latest session archive when available. |
-| **`PreInvocation` Hook** | `./scripts/ov-agy hook pre-invocation` | Uses `lastUserInput` and the transcript (preferring `transcript_full.jsonl`) to identify the user turn for coding-context recall. |
-| **`PreToolUse` Hook** | `./scripts/ov-agy hook pre-tool` | Blocks local file operations whose path starts with `viking://`. A URI quoted in the file body or search pattern is allowed. |
-| **`Stop` Hook & Worker** | `./scripts/ov-agy hook stop` -> `ov-agy worker` | On idle Stop, sends finished messages to `agy-{conversationId}`, commits the remaining batch, and replays the matching offline queue. |
+| **MCP Proxy** | `ov-agy mcp-proxy` (`mcp_config.json`) | Negotiates the workspace with agy using MCP `roots/list` and forwards JSON/SSE requests to `{base_url}/mcp`, up to 16 at once: replies may come back out of order, while `initialize` and notifications keep theirs. An expired session is reinitialized on HTTP 404. After a 401/403 the proxy rereads `ovcli.conf` and `ov.conf` and, if they changed (`ov config switch`, `ov-agy setup`), reconnects once with the new key. A request that outlives the 60 s timeout gets JSON-RPC error `-32004`. |
+| **`SessionStart` Hook** | `sh ./scripts/ov-agy hook session-start` | Checks connectivity and injects an `<openviking-session>` status block plus `<openviking-context source="startup">`: the user and project profiles, the memory index and the skill catalog, within `sessionStartMaxBytes`. It also starts the idle sweep. |
+| **`PreInvocation` Hook** | `sh ./scripts/ov-agy hook pre-invocation` | Uses `lastUserInput` and the transcript (preferring `transcript_full.jsonl`) to identify the user turn for coding-context recall. After `/compact` it injects the startup block again (`source="compaction"`) and commits the session. |
+| **`PostInvocation` Hook** | `sh ./scripts/ov-agy hook post-invocation` | After a turn's final answer, shows a user-only line naming the OpenViking sources the turn used, such as `OpenViking · 3 sources · 2 memories · 1 read` (`usageView`). The model never sees it. |
+| **`PreToolUse` Hook** | `sh ./scripts/ov-agy hook pre-tool` | Blocks local file operations whose path starts with `viking://`. A URI quoted in the file body or search pattern is allowed. Every other call gets `ask`, which leaves agy's normal permission flow in charge (agy denies a reply without a decision, and `allow` would bypass your own rules). |
+| **`Stop` Hook & Worker** | `sh ./scripts/ov-agy hook stop` -> `ov-agy worker` | On idle Stop, sends finished messages to `agy-{conversationId}` in batches of 100: text verbatim, plus each tool call paired with its result as a `tool` part. It commits once the server reports `commitTokenThreshold` pending tokens, replays the matching offline queue, and records the pass in `last-capture.json`. |
+| **Idle Sweep** | `ov-agy sweep` (started by `SessionStart`) | agy has no `SessionEnd`, so a new session commits conversations idle for 30 minutes, replays offline queues, and retires state older than 30 days. |
+| **Commands** | `scripts/ov-agy doctor` / `status` / `setup` | `doctor` checks the install, configuration, server and recent activity; `status` shows what the plugin is doing right now; `setup` writes a verified url and key to `ovcli.conf`. |
 | **Subagent** | `agents/viking-navigator.md` | Read-only background subagent (`inheritMcp: true`, `commandExecutionPolicy: off`) performing progressive L0 -> L1 -> L2 exploration of `viking://` trees without bloating the main context window. |
-| **Skills (`/ov-*`)** | `skills/*/SKILL.md` | `/ov-doctor` (connectivity & WAL diagnostics), `/ov-ingest` (resource/skill ingestion SOP), `/ov-experience` (telemetry-preserving troubleshooting recall), and `/ov-rule-search` (compiled architectural compliance search). |
+| **Skills** | `skills/*/SKILL.md` | `openviking-memory` (choosing a retrieval tool, when to write), `openviking-skills` (stored skills), `/ov-doctor` (diagnostics), `/ov-ingest` (resource and skill ingestion), `/ov-experience` (Experience recall), and `/ov-rule-search` (compiled rules). |
 | **Always-On Rule** | `rules/openviking-context.md` | Enforces `viking://` virtual URI boundaries, `viking://~` home-alias addressing, L0 -> L1 -> L2 progressive retrieval, and live workspace provenance priority (`trigger: always_on`). |
 
 With agy 1.5.16, ACP `session/load` restores conversation history without a second `SessionStart`. The next prompt runs semantic recall and capture continues from the saved cursor.
@@ -56,7 +59,7 @@ With agy 1.5.16, ACP `session/load` restores conversation history without a seco
 ```mermaid
 flowchart LR
     AGY["Antigravity CLI (agy)"]
-    HOOKS["Lifecycle Hooks\n(session-start / pre-invocation / pre-tool / stop)"]
+    HOOKS["Lifecycle Hooks\n(session-start / pre-invocation / post-invocation / pre-tool / stop)"]
     MCP["ov-agy mcp-proxy\n(stdio <-> Streamable HTTP)"]
     WORKER["Detached ov-agy worker"]
     WAL[("Offline WAL\nwal/{scope}/pending.jsonl")]
@@ -65,8 +68,8 @@ flowchart LR
     AGY -->|"stdin/stdout JSON"| HOOKS
     AGY <-->|"stdio JSON-RPC"| MCP
     HOOKS -->|"mode=context recall"| OV
-    HOOKS -.->|"spawn on fullyIdle"| WORKER
-    MCP <-->|"JSON & SSE + 404 recovery"| OV
+    HOOKS -.->|"spawn on fullyIdle, idle sweep at start"| WORKER
+    MCP <-->|"JSON & SSE, 16 in flight, 404 / 401 recovery"| OV
     WORKER -->|"sanitized turns & commit"| OV
     WORKER <-->|"queue on outage / replay"| WAL
 ```
@@ -75,8 +78,8 @@ flowchart LR
 
 ### Prerequisites
 
-1. **Google Antigravity CLI (`agy`)** installed on macOS, Linux, or Windows.
-2. **OpenViking Server** running locally (`http://127.0.0.1:1933`) or reachable over HTTPS.
+1. **Google Antigravity CLI (`agy`)** installed on macOS or Linux. Windows is untested: the hooks and the MCP server start `sh ./scripts/ov-agy`, so `sh` from Git for Windows must be on `PATH` (choose "Use Git and optional Unix tools from the Command Prompt" when installing it).
+2. **OpenViking Server** running locally (`http://127.0.0.1:1933`) or reachable over HTTPS. `ov-agy` checks TLS with rustls against the bundled Mozilla roots and the operating system's trust store (macOS keychain, the Linux CA bundle, the Windows store; `SSL_CERT_FILE` / `SSL_CERT_DIR` replace that store when set). For a private CA outside the store, point `OPENVIKING_CA_CERTS` at its PEM file.
 
 ### One-Line Remote Install
 
@@ -84,14 +87,16 @@ flowchart LR
 agy plugin install https://github.com/JamCh01/agy-openviking
 ```
 
-On the first invocation when no local Cargo build is present, `./scripts/ov-agy` reads the exact plugin `version` from `.antigravity-plugin/plugin.json`, downloads the matching prebuilt binary archive (`aarch64-apple-darwin`, `x86_64-apple-darwin`, `x86_64-unknown-linux-musl`, `aarch64-unknown-linux-musl`, or `x86_64-pc-windows-msvc`) into an isolated temporary directory, verifies its **SHA-256** digest against `checksums.txt`, and atomically places the executable into `${PLUGIN_DATA}/bin/ov-agy-v<version>`.
+agy's `/plugin` marketplaces list only the catalogs Google curates, so the plugin installs from its GitHub repository (or a local directory, see below).
+
+On the first invocation when no local Cargo build is present, `./scripts/ov-agy` reads the exact plugin `version` from `.antigravity-plugin/plugin.json`, downloads the matching prebuilt binary archive (`aarch64-apple-darwin`, `x86_64-apple-darwin`, `x86_64-unknown-linux-musl`, `aarch64-unknown-linux-musl`, or `x86_64-pc-windows-msvc`) into an isolated temporary directory, verifies its **SHA-256** digest against `checksums.txt`, and atomically places the executable into `${PLUGIN_DATA}/bin/ov-agy-v<version>`. The MCP server launch waits for this download. Hooks never do: agy fails a tool call whose `PreToolUse` hook times out, so until the binary is cached each hook answers at once (`ask` for `PreToolUse`, `{}` otherwise) and starts a single background download.
 
 ### Mirror / Restricted Network Acceleration
 
 In Mainland China, corporate intranets, or air-gapped environments, set `OPENVIKING_RELEASE_BASE_URL` to mirror or proxy the GitHub Release asset prefix (hosting `ov-agy-v<version>-<target>.tar.gz` / `.zip` and `checksums.txt`):
 
 ```bash
-export OPENVIKING_RELEASE_BASE_URL="https://mirror.example.com/JamCh01/agy-openviking/releases/download/v0.1.2"
+export OPENVIKING_RELEASE_BASE_URL="https://mirror.example.com/JamCh01/agy-openviking/releases/download/v0.2.0"
 ```
 
 ### Build from Source (Local Development)
@@ -112,7 +117,15 @@ When `target/release/ov-agy` (or `target/debug/ov-agy`) exists inside the plugin
 
 ### Quick Configuration (`~/.openviking/ovcli.conf`)
 
-Create `~/.openviking/ovcli.conf` (`chmod 600`) pointing to your OpenViking server:
+The plugin's setup command asks for the url and key, checks them against the server (reachable, key accepted, not the root key), and merges them into `~/.openviking/ovcli.conf`, keeping the previous file as `ovcli.conf.bak-<time>`; both are mode 0600:
+
+```bash
+~/.gemini/config/plugins/openviking/scripts/ov-agy setup
+# without prompts, keeping the key out of shell history:
+printf '%s\n' "$OV_KEY" | ~/.gemini/config/plugins/openviking/scripts/ov-agy setup --url https://ov.example.com --api-key-stdin --yes
+```
+
+`--dry-run` shows the merged file with the key masked, and `--no-verify` skips the server check. The OpenViking CLI's `ov config` writes the same file. To write it by hand, create `~/.openviking/ovcli.conf` (`chmod 600`) pointing to your OpenViking server:
 
 ```json
 {
@@ -131,14 +144,16 @@ Create `~/.openviking/ovcli.conf` (`chmod 600`) pointing to your OpenViking serv
 
 ### Skills, Subagent, and CLI Diagnostics
 
-- **`/ov-doctor` (Health & Configuration Check)**: Inspects resolved configuration layers, masked API key status, Root-Key `403` guard, `/health` latency, `/mcp` handshake, Git `peer` normalization, and pending WAL entries. You can also run it directly from a terminal:
+- **`/ov-doctor` (Health & Configuration Check)**: Runs `ov-agy doctor`, which reports ok/info/warn/fail findings with a fix for each problem in four sections: the plugin install (manifest, hooks, launcher, MCP entry, enablement in agy), the configuration (sources, url lint, masked key, root-key guard, peer, toggles, proxy variables, TLS roots), the server (`/health` with the identity the key resolves to, `/ready`, `/api/v1/system/status`, a read of `viking://~/memories`, MCP `tools/list`), and recent activity (last injection, recall and capture, offline queues, hook errors in the debug log). The human report exits 1 when a check fails; `--json` always exits 0 and carries `ok`. `ov-agy status` prints a one-screen summary instead. From a terminal:
   ```bash
-  ./scripts/ov-agy doctor
-  ./scripts/ov-agy doctor --json
+  ~/.gemini/config/plugins/openviking/scripts/ov-agy doctor
+  ~/.gemini/config/plugins/openviking/scripts/ov-agy doctor --json
+  ~/.gemini/config/plugins/openviking/scripts/ov-agy status
   ```
+- **`openviking-memory` and `openviking-skills`**: model-invoked skills, as in the Codex and Claude Code plugins. The first covers choosing between context search, `find`, list search and `grep`, reading `viking://` URIs, when (not) to write, and where memories are filed; the second covers finding, using, creating, sharing and migrating skills stored in OpenViking.
 - **`/ov-ingest` (Knowledge & Skill Ingestion)**: Guided workflow for importing web docs, local specifications, or Git repositories into `viking://resources/...` (`add_resource`) and packaging reusable skills (`add_skill`) while tracking asynchronous L0/L1 indexing tasks.
-- **`/ov-experience` (Operational Troubleshooting Recall)**: Queries `search_experience` and `read_experience` with verbatim canonical `viking://` URIs so OpenViking records recall and consumption telemetry accurately.
-- **`/ov-rule-search` (Architectural Compliance Search)**: Queries compiled team constraints via `rule_search` (`applies_when` / `exception` predicates) before modifying unfamiliar modules or public contracts.
+- **`/ov-experience` (Operational Troubleshooting Recall)**: Searches `viking://~/memories/experiences` with `find` or `search`, then reads the full bodies of at most three matching Experiences with `read`, passing canonical `viking://` URIs verbatim.
+- **`/ov-rule-search` (Architectural Compliance Search)**: Queries compiled team constraints via `rule_search` (`applies_when` / `exception` predicates) before modifying unfamiliar modules or public contracts, and reads the Rules an incomplete delivery (`delivery.complete: false`) left out before acting.
 - **`viking-navigator` Subagent**: Ask `agy` to delegate broad `viking://resources` or `viking://~/memories` surveys to `viking-navigator`, which triages L0 `.abstract.md` and L1 `.overview.md` summaries before selectively reading L2 source documents.
 
 ### Configuration Priority Waterfall
@@ -152,7 +167,7 @@ When `OPENVIKING_CREDENTIAL_SOURCE=auto` (default), `ov-agy` resolves settings f
 5. **OpenViking Server Config**: `~/.openviking/ov.conf` (or `OPENVIKING_CONFIG_FILE`, including `server.*` and `antigravity.*`)
 6. **Built-in Defaults**: `http://127.0.0.1:1933` (if neither config files nor `OPENVIKING_MEMORY_ENABLED` exist, the plugin remains silently disabled with zero overhead).
 
-Workspace files configure the peer and plugin behavior. Set the server URL, API key, account and user in your personal configuration or environment. Offline queues are scoped to those connection details and the peer. The legacy `wal/pending.jsonl` is retained for manual recovery.
+A repository's `.openviking/config.json` and `.openviking/config.local.json` may set only `peer.{id,source}`, `recall.{enabled,peer_scope,dedup_turns,max_items,score_threshold}`, `capture.{enabled,commit_token_threshold}`, `bypass.session_patterns` and `usage.{view,output}`, because anyone can commit them. A personal registry entry in `~/.openviking/workspaces/` with the same keys outranks both for the repository it names. Filters, debug logging, timeouts and other behavior come from your personal configuration or environment, and so do the server URL, API key, account and user; `ov-agy doctor` lists every ignored key. Offline queues are scoped to those connection details and the peer. The legacy `wal/pending.jsonl` is retained for manual recovery.
 
 ### Environment Variables Reference
 
@@ -162,21 +177,31 @@ Workspace files configure the peer and plugin behavior. Set the server URL, API 
 | `OPENVIKING_CREDENTIAL_SOURCE` | `auto` | Credential source policy: `auto`, `cli` (config files only), or `env` (environment only). |
 | `OPENVIKING_URL` / `OPENVIKING_BASE_URL` | `http://127.0.0.1:1933` | OpenViking HTTP server base URL. |
 | `OPENVIKING_MCP_URL` | `{base_url}/mcp` | Override endpoint URL for Streamable HTTP MCP. |
-| `OPENVIKING_API_KEY` / `OPENVIKING_BEARER_TOKEN` | *(empty)* | User or tenant Admin API key (`Authorization: Bearer` + `X-API-Key`). |
-| `OPENVIKING_ACCOUNT` | *(empty)* | Explicit `X-OpenViking-Account` header override. |
-| `OPENVIKING_USER` | *(empty)* | Explicit `X-OpenViking-User` header override. |
+| `OPENVIKING_API_KEY` / `OPENVIKING_BEARER_TOKEN` | *(empty)* | User or tenant Admin API key, sent as `Authorization: Bearer`. |
+| `OPENVIKING_ACCOUNT` | *(empty)* | Account for trusted mode, sent as `X-OpenViking-Account`. |
+| `OPENVIKING_USER` | *(empty)* | User for trusted mode, sent as `X-OpenViking-User`. |
+| `OPENVIKING_AUTH_MODE` | `api_key`, or `trusted` when an account or user is set | `trusted` sends the account and user headers; with `api_key` the key alone carries the identity. |
+| `OPENVIKING_EXTRA_HEADERS` | *(empty)* | JSON object of extra request headers for a gateway in front of the server (for example Cloudflare Access). `Authorization`, `X-API-Key`, `Accept`, `Content-Type` and the MCP headers cannot be overridden. |
+| `OPENVIKING_CA_CERTS` | *(empty)* | PEM bundle of extra trusted CA certificates, added to the bundled Mozilla roots and the system store. Also `caCerts` in the `plugin.antigravity` block of `ovcli.conf`; falls back to `NODE_EXTRA_CA_CERTS`, which the Node-based OpenViking plugins read. Repository files cannot set it. |
 | `OPENVIKING_PEER_ID` | Auto (Git remote / dir) | Explicit `X-OpenViking-Actor-Peer` repository peer identifier override. |
+| `OPENVIKING_PEER_SOURCE` | `git` | How the peer is derived when none is set: `git` (the `origin` remote, else the repository root), `cwd`, `none`, or a template with `{git_remote}`, `{git_root}`, `{cwd}`, `{dir}` and `{harness}`. |
 | `OPENVIKING_HOME` | `~/.openviking` | Base directory for OpenViking configuration and logs. |
 | `OPENVIKING_CLI_CONFIG_FILE` | `~/.openviking/ovcli.conf` | Path override for the OpenViking CLI JSON config file. |
 | `OPENVIKING_CONFIG_FILE` | `~/.openviking/ov.conf` | Path override for the OpenViking server JSON config file. |
 | `OPENVIKING_PLUGIN_DATA` / `OPENVIKING_STATE_DIR` | `~/.openviking/agy-plugin` | Persistent directory for turn state, locks, `wal/<scope>/pending.jsonl`, and cached binaries. |
 | `OPENVIKING_TIMEOUT_MS` | `15000` | HTTP request timeout in milliseconds (`500`–`300000`). |
 | `OPENVIKING_AUTO_RECALL` | `true` | Enables automatic turn-level context recall in `PreInvocation`. |
-| `OPENVIKING_AUTO_CAPTURE` | `true` | Enables detached conversation turn capture and commit on `Stop`. |
+| `OPENVIKING_AUTO_CAPTURE` | `true` | Enables detached conversation turn capture on `Stop` and the idle sweep on `SessionStart`. |
 | `OPENVIKING_RECALL_LIMIT` | Server preset | Distributes explicit values (1–50) across six coding sources with at least one slot each. Legacy find defaults to 6. |
 | `OPENVIKING_RECALL_MAX_TOKENS` | Server default | Token budget for context recall (64–32000). |
-| `OPENVIKING_RECALL_REWRITE` | Off | Request server rewriting with `server` or `auto` within the hook timeout. |
-| `OPENVIKING_NO_AUTO_INJECT` | `false` | Skip startup profiles, indexes, and skills. The session archive and per-turn recall remain available. |
+| `OPENVIKING_RECALL_REWRITE` | Off | Request server rewriting with `server` or `auto`. Rewriting needs a recall budget of tens of seconds. |
+| `OPENVIKING_RECALL_TIMEOUT_MS` | `3800` | Recall request budget in `PreInvocation` (`1000`–`25000`). Every new prompt waits for it, so raise it only for a slow server. |
+| `OPENVIKING_RECALL_QUERY_EXPANSION` | `off` below 10 s | `auto` or `off`. The server's query expansion cannot finish inside a short budget, so recall sends `off` unless you choose a mode or raise the budget to 10 s or more. |
+| `OPENVIKING_NO_AUTO_INJECT` | `false` | Skip the startup block (profiles, memory index, skills). Per-prompt recall stays on. |
+| `OPENVIKING_PROFILE_TOKEN_BUDGET` | `10000` | Tokens for the startup profiles and memory index (`500`–`50000`). |
+| `OPENVIKING_SKILL_CATALOG` | `true` | Include the `<available-skills>` catalog in the startup block. |
+| `OPENVIKING_SKILL_CATALOG_TOKEN_BUDGET` | `1200` | Tokens for the skill catalog; names only when descriptions do not fit. |
+| `OPENVIKING_SESSION_START_MAX_BYTES` | `9500` | UTF-8 cap on the startup block. The profile, index and catalog budgets shrink to fit under it (about 4 bytes per token), so a large memory index is trimmed with "+N more" lines; only if an estimate still overshoots is the index dropped, then the catalog. |
 | `OPENVIKING_RECALL_DEDUP_TURNS` | `5` | Server-side cross-turn deduplication window (`0`–`20`). |
 | `OPENVIKING_SCORE_THRESHOLD` | `0.35` | Minimum relevance score threshold for recalled entries (`0.0`–`1.0`). |
 | `OPENVIKING_MIN_QUERY_LENGTH` | `3` | Minimum user prompt character count required to trigger recall (`1`–`64`). |
@@ -184,8 +209,20 @@ Workspace files configure the peer and plugin behavior. Set the server URL, API 
 | `OPENVIKING_RECALL_EXCLUDE_URIS` | *(empty)* | Comma-separated or JSON array of `viking://` URI prefixes to exclude from recall. |
 | `OPENVIKING_RECALL_QUERY_FILTERS` | *(empty)* | `sed`-style (`s/pat/rep/g`, `d/pat/`, `k/pat/`) or regex drop rules applied before recall. |
 | `OPENVIKING_CAPTURE_FILTERS` | *(empty)* | `sed`-style or regex redaction/drop rules (supports `user:` / `assistant:` prefixes) before capture. |
-| `OPENVIKING_CAPTURE_MAX_LENGTH` | `24000` | Per-message character cap for session capture (`200`–`100000`). |
-| `OPENVIKING_COMMIT_EVERY_TURNS` | `6` | Commit interval within a capture batch (1–1000). Idle Stop also commits the remaining messages. |
+| `OPENVIKING_CAPTURE_TOOL_CALLS` | `true` | Captures tool calls and their results (file reads, commands, MCP calls) as `tool` parts. Set `false` to send only the conversation text. |
+| `OPENVIKING_CAPTURE_TOOL_MAX_CHARS` | `1000000` | Guard for pathological tool payloads (`200`–`1000000`); the server externalizes large output itself. Longer values keep their head and tail around an omission marker. |
+| `OPENVIKING_COMMIT_TOKEN_THRESHOLD` | `20000` | Commit when the session has this many pending tokens (`1000`–`1000000`), as the Codex and Claude Code plugins do. A repository may set `capture.commit_token_threshold`. |
+| `OPENVIKING_COMMIT_EVERY_TURNS` | *(unset)* | Optional extra trigger: also commit after this many uncommitted messages (`1`–`1000`). |
+| `OPENVIKING_AGY_IDLE_TTL_MS` | `1800000` | agy has no `SessionEnd`, so the next `SessionStart` commits conversations idle this long (at most one sweep per 10 minutes). |
+| `OPENVIKING_IDLE_SWEEP` | `true` | Set `false` to stop `SessionStart` from starting the idle sweep. |
+| `OPENVIKING_AUTO_COMMIT_ON_COMPACT` | `true` | Commit the session when agy compacts the conversation. |
+| `OPENVIKING_RESUME_ARCHIVE_INJECT` | `false` | Add the latest session archive overview to the context injected after `/compact`. |
+| `OPENVIKING_RESUME_ARCHIVE_TOKEN_BUDGET` / `OPENVIKING_RESUME_ARCHIVE_MAX_CHARS` | `32000` / `6000` | Size limits for that archive overview. |
+| `OPENVIKING_USAGE_VIEW` | `summary` | The per-answer source line: `summary`, `expanded` (one line per source) or `off`. |
+| `OPENVIKING_USAGE_OUTPUT` | `notice` | `notice` shows the line to the user only; `footer` asks the model to end its answer with the sources it used. |
+| `OPENVIKING_BYPASS_SESSION` | `false` | Every hook skips the server. |
+| `OPENVIKING_BYPASS_SESSION_PATTERNS` | *(empty)* | Comma-separated globs (`**` crosses `/`) matched against the conversation id, `agy-<id>` and the workspace path; a match skips recall and capture. |
+| `OPENVIKING_PENDING_TTL_DAYS` / `OPENVIKING_PENDING_MAX_RETRIES` | `7` / `50` | Offline-queue entries older than this, or retried this often, are dropped. |
 | `OPENVIKING_DEBUG` | `false` | Appends structured diagnostic events to `OPENVIKING_DEBUG_LOG` (never `stdout`). |
 | `OPENVIKING_DEBUG_LOG` | `~/.openviking/logs/agy.jsonl` | File path for JSONL diagnostic logs when `OPENVIKING_DEBUG=true`. |
 | `OPENVIKING_RELEASE_BASE_URL` | GitHub Releases URL | Custom base URL prefix used by `scripts/fetch-binary.sh` for prebuilt binary downloads. |
