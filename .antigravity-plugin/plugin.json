@@ -2,7 +2,7 @@
   "$schema": "https://antigravity.google/schemas/v1/plugin.json",
   "name": "openviking",
   "displayName": "OpenViking Context & Memory",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "logo": "assets/logo.svg",
   "description": "Long-term memory, hierarchical L0/L1/L2 context retrieval, architectural rules, and remote skills for Antigravity CLI via OpenViking.",
   "suggestedPrompts": [
