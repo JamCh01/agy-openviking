@@ -1,21 +1,23 @@
-//! `SessionStart` hook injecting `<openviking-session>` and `<available-skills>` context.
+//! `SessionStart` hook injecting `<openviking-session>` status and the startup context
+//! (profiles, memory index, skills catalog).
 
-use std::collections::HashSet;
 use std::path::Path;
+use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use serde_json::json;
 
 use crate::client::{ClientError, OvClient};
-use crate::config::ResolvedConfig;
-use crate::wire::{CommonHookInput, InjectOutput, OvFsEntry};
+use crate::config::{self, ResolvedConfig};
+use crate::startup::{self, PER_REQUEST_TIMEOUT};
+use crate::wire::{CommonHookInput, InjectOutput};
 
-const SESSION_START_BUDGET: Duration = Duration::from_millis(1500);
-const PER_REQUEST_TIMEOUT: Duration = Duration::from_millis(1200);
+/// Below the 5 s hook timeout; the reads run in parallel, each bounded by `PER_REQUEST_TIMEOUT`.
+const SESSION_START_BUDGET: Duration = Duration::from_secs(4);
 
-/// Executes `SessionStart` within a strict `1500ms` timeout budget.
+/// Executes `SessionStart` within `SESSION_START_BUDGET`.
 pub async fn run(raw_stdin: &str) -> InjectOutput {
-    match tokio::time::timeout(SESSION_START_BUDGET, run_inner(raw_stdin)).await {
+    match tokio::time::timeout(SESSION_START_BUDGET, Box::pin(run_inner(raw_stdin))).await {
         Ok(output) => output,
         Err(_) => InjectOutput::empty(),
     }
@@ -35,56 +37,43 @@ async fn run_inner(raw_stdin: &str) -> InjectOutput {
         return InjectOutput::empty();
     }
 
+    start_idle_sweep(
+        &cfg,
+        parsed.conversation_id.as_deref(),
+        parsed.effective_workspace(),
+    );
+    if cfg.is_bypassed(
+        parsed.conversation_id.as_deref(),
+        parsed.effective_workspace(),
+    ) {
+        cfg.log_debug("hook.session_start", "bypassed", json!({}));
+        return InjectOutput::empty();
+    }
+
     let Ok(client) = OvClient::try_new(cfg.clone()) else {
         return InjectOutput::empty();
     };
 
-    let skills = async |uri| {
-        if cfg.inject_startup_memories {
-            client.list_entries(uri, false, PER_REQUEST_TIMEOUT).await
-        } else {
-            Ok(Vec::new())
-        }
-    };
-    let (health_res, status_res, user_skills_res, shared_skills_res, startup, archive) = tokio::join!(
+    let (health_res, status_res, startup) = tokio::join!(
         client.health(PER_REQUEST_TIMEOUT),
         client.system_status(PER_REQUEST_TIMEOUT),
-        skills("viking://~/skills"),
-        skills("viking://agent/skills"),
-        startup_memories(&client, &cfg),
-        async {
-            let id = parsed
-                .conversation_id
-                .as_deref()
-                .filter(|s| !s.is_empty())?;
-            client
-                .latest_archive(&format!("agy-{id}"), PER_REQUEST_TIMEOUT)
-                .await
-        },
+        startup::build(&client, &cfg),
     );
 
     let mut root_key_403 = cfg.root_key_warning.clone();
-    let error_codes = [
-        status_res.as_ref().err().and_then(ClientError::status_code),
-        user_skills_res
-            .as_ref()
-            .err()
-            .and_then(ClientError::status_code),
-    ];
-    for code in error_codes.into_iter().flatten() {
-        if code == 403 && root_key_403.is_none() {
-            root_key_403 = Some(
-                "OpenViking returned HTTP 403 Forbidden (likely `server.root_api_key` used as client key). Configure a User/Admin Key via `ov config` in `~/.openviking/ovcli.conf`.".to_string(),
-            );
-        }
+    if root_key_403.is_none()
+        && status_res.as_ref().err().and_then(ClientError::status_code) == Some(403)
+    {
+        root_key_403 = Some(
+            "OpenViking returned HTTP 403 Forbidden (likely `server.root_api_key` used as client key). Configure a User/Admin Key via `ov config` in `~/.openviking/ovcli.conf`.".to_string(),
+        );
     }
 
     let Ok(health_probe) = health_res else {
         if let Some(warning) = root_key_403 {
-            let block = format!(
+            return InjectOutput::new_system(format!(
                 "<openviking-session>\nstatus: warning\nwarning: {warning}\n</openviking-session>"
-            );
-            return InjectOutput::new_system(block);
+            ));
         }
         cfg.log_debug("hook.session_start", "health_unreachable", json!({}));
         return InjectOutput::empty();
@@ -102,7 +91,6 @@ async fn run_inner(raw_stdin: &str) -> InjectOutput {
                 cfg.user.clone()
             }
         });
-
     let server_ver = health_probe
         .response
         .version
@@ -121,185 +109,77 @@ async fn run_inner(raw_stdin: &str) -> InjectOutput {
         ),
         format!("identity: user={resolved_user}, peer={peer_label}"),
     ];
-    if let Some(ref conv_id) = parsed.conversation_id {
-        if !conv_id.trim().is_empty() {
-            session_lines.push(format!("session_id: agy-{}", conv_id.trim()));
-        }
+    if let Some(conv_id) = parsed
+        .conversation_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+    {
+        session_lines.push(format!("session_id: agy-{conv_id}"));
     }
     if let Some(warning) = root_key_403 {
         session_lines.push(format!("warning: {warning}"));
     }
     session_lines.push("</openviking-session>".to_string());
 
-    let mut combined_sections = vec![session_lines.join("\n")];
-
-    if !startup.is_empty() {
-        combined_sections.push(super::pre_invocation::wrap_openviking_context(&startup));
+    let mut sections = vec![session_lines.join("\n")];
+    let mut stats = json!({});
+    if let Some(block) = startup {
+        sections.push(startup::wrap("startup", &block.text));
+        stats = block.stats;
     }
-    if let Some(text) = archive.filter(|s| !s.trim().is_empty()) {
-        let overview: String = text.chars().take(2000).collect();
-        combined_sections.push(super::pre_invocation::wrap_openviking_context(&format!(
-            "Latest session archive:\n{overview}"
-        )));
-    }
-
-    let skills_block = format_available_skills(
-        user_skills_res.unwrap_or_default(),
-        shared_skills_res.unwrap_or_default(),
-    );
-    if let Some(sb) = skills_block {
-        combined_sections.push(sb);
-    }
-
-    let message = combined_sections.join("\n\n");
+    let message = sections.join("\n\n");
+    record_injection(&cfg, "startup", &message);
     cfg.log_debug(
         "hook.session_start",
         "injected",
-        json!({ "chars": message.len(), "peer": cfg.peer_id }),
+        json!({ "chars": message.len(), "peer": cfg.peer_id, "startup": stats }),
     );
     InjectOutput::new_system(message)
 }
 
-async fn startup_memories(client: &OvClient, cfg: &ResolvedConfig) -> String {
-    if !cfg.inject_startup_memories {
-        return String::new();
-    }
-    let (mut lines, peer) = tokio::join!(profile_lines(client, "viking://~/memories"), async {
-        if cfg.peer_id.is_empty() {
-            Vec::new()
-        } else {
-            profile_lines(
-                client,
-                &format!("viking://~/peers/{}/memories", cfg.peer_id),
-            )
-            .await
-        }
-    });
-    lines.extend(peer);
-    lines.join("\n")
-}
-
-async fn profile_lines(client: &OvClient, root: &str) -> Vec<String> {
-    let profile_uri = format!("{root}/profile.md");
-    let prefs_uri = format!("{root}/preferences");
-    let entities_uri = format!("{root}/entities");
-    let (profile, prefs, entities) = tokio::join!(
-        client.read_profile(&profile_uri, PER_REQUEST_TIMEOUT),
-        client.list_entries(&prefs_uri, true, PER_REQUEST_TIMEOUT),
-        client.list_entries(&entities_uri, true, PER_REQUEST_TIMEOUT),
+/// Keeps a copy of the last injected context for `ov-agy status` and audits, like the Claude
+/// Code plugin's `last_inject.md`.
+pub(crate) fn record_injection(cfg: &ResolvedConfig, source: &str, message: &str) {
+    let body = format!(
+        "<!-- source={source} at={} -->\n{message}\n",
+        config::now_epoch_ms()
     );
-    let mut lines = Vec::new();
-    if let Some(text) = profile.filter(|s| !s.trim().is_empty()) {
-        lines.push(format!(
-            "{profile_uri}\n{}",
-            text.chars().take(2400).collect::<String>()
-        ));
+    let path = cfg.state_dir.join("last-inject.md");
+    if config::ensure_private_dir(&cfg.state_dir).is_ok() {
+        if let Ok(mut file) =
+            config::open_private_file(&path, config::PrivateOpenMode::TruncateWrite)
+        {
+            let _ = std::io::Write::write_all(&mut file, body.as_bytes());
+        }
     }
-    for (parent, entries) in [(prefs_uri, prefs), (entities_uri, entities)] {
-        lines.extend(
-            entries
-                .unwrap_or_default()
-                .into_iter()
-                .filter_map(|entry| {
-                    if entry.is_dir || entry.access.as_deref() == Some("denied") {
-                        return None;
-                    }
-                    let uri = entry.uri.or_else(|| {
-                        entry
-                            .rel_path
-                            .or(entry.name)
-                            .map(|name| format!("{parent}/{name}"))
-                    })?;
-                    if uri.contains("/.")
-                        || !Path::new(&uri)
-                            .extension()
-                            .is_some_and(|ext| ext.eq_ignore_ascii_case("md"))
-                    {
-                        return None;
-                    }
-                    let mut line: String = uri.chars().take(512).collect();
-                    if let Some(summary) = entry
-                        .abstract_text
-                        .as_deref()
-                        .and_then(|s| s.lines().next())
-                    {
-                        line.push(' ');
-                        line.extend(summary.chars().take(160));
-                    }
-                    Some(line)
-                })
-                .take(6),
-        );
-    }
-    lines
 }
 
-fn format_available_skills(
-    user_entries: Vec<OvFsEntry>,
-    shared_entries: Vec<OvFsEntry>,
-) -> Option<String> {
-    let mut seen_names = HashSet::new();
-    let mut lines = Vec::new();
-
-    for (scope_uri, entries) in [
-        ("viking://~/skills", user_entries),
-        ("viking://agent/skills", shared_entries),
-    ] {
-        for entry in entries {
-            if entry.access.as_deref() == Some("denied") {
-                continue;
-            }
-            let name = entry
-                .name
-                .as_deref()
-                .map(str::trim)
-                .filter(|n| !n.is_empty() && !n.starts_with('.'))
-                .or_else(|| {
-                    entry
-                        .uri
-                        .as_deref()
-                        .and_then(|u| u.trim_end_matches('/').rsplit('/').next())
-                        .filter(|n| !n.is_empty() && !n.starts_with('.'))
-                });
-            let Some(skill_name) = name else {
-                continue;
-            };
-            if !seen_names.insert(skill_name.to_string()) {
-                continue;
-            }
-            let canonical_uri = entry
-                .uri
-                .as_deref()
-                .map(str::trim)
-                .filter(|u| !u.is_empty())
-                .map_or_else(|| format!("{scope_uri}/{skill_name}"), ToString::to_string);
-            let summary = entry
-                .abstract_text
-                .as_deref()
-                .or(entry.overview.as_deref())
-                .map_or("", |s| s.lines().next().unwrap_or("").trim());
-
-            if summary.is_empty() {
-                lines.push(format!("- {skill_name} ({canonical_uri})"));
-            } else {
-                let short_desc: String = summary.chars().take(160).collect();
-                lines.push(format!("- {skill_name} ({canonical_uri}): {short_desc}"));
-            }
-            if lines.len() >= 25 {
-                break;
-            }
-        }
-        if lines.len() >= 25 {
-            break;
-        }
+/// agy has no `SessionEnd`: a new session is the moment to commit conversations that went
+/// idle. The sweep runs detached so it never delays the session that is starting.
+fn start_idle_sweep(cfg: &ResolvedConfig, conversation_id: Option<&str>, workspace: Option<&str>) {
+    if !cfg.auto_capture || !cfg.idle_sweep || !crate::sweep::claim_sweep_slot(cfg) {
+        return;
     }
-
-    if lines.is_empty() {
-        None
-    } else {
-        let joined = lines.join("\n");
-        Some(format!(
-            "<available-skills>\nRemote skills in OpenViking (read `<uri>/SKILL.md` via OpenViking MCP `read` tool):\n{joined}\n</available-skills>"
-        ))
+    let Ok(exe) = std::env::current_exe() else {
+        return;
+    };
+    let mut cmd = Command::new(exe);
+    cmd.arg("sweep");
+    if let Some(id) = conversation_id.map(str::trim).filter(|id| !id.is_empty()) {
+        cmd.arg("--exclude").arg(id);
     }
+    if let Some(ws) = workspace {
+        cmd.arg("--cwd").arg(ws);
+    }
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    super::stop::detach_from_hook_process_group(&mut cmd);
+    let spawned = cmd.spawn().map(|child| child.id());
+    cfg.log_debug(
+        "hook.session_start",
+        "sweep_spawned",
+        json!({ "pid": spawned.as_ref().ok(), "error": spawned.err().map(|e| e.to_string()) }),
+    );
 }

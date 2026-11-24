@@ -22,11 +22,15 @@ Before modifying unfamiliar modules, cross-service contracts, database schemas, 
    - Call the registered OpenViking MCP `rule_search` tool (e.g., `openviking_rule_search` or `rule_search`) with `task_context` (and optional `rule_probability_threshold`, default `0.65`).
    - Do **not** substitute generic `find` or `search` for `rule_search` when `rule_search` is available; compiled Rules carry structured `applies_when` and `exception` predicates.
 3. **Evaluate Applicability Independently**:
+   - Returned Rules are constraints, not evidence that an unobserved applicability condition is true. Do not leave facts out of `task_context` to steer which Rules come back.
    - Inspect every returned Rule in `rules` / `rendered`:
      - Empty `applies_when` means the Rule applies unconditionally unless its `exception` holds.
      - Non-empty `applies_when` applies only when concrete facts in the current task satisfy that condition.
-4. **Handle Incomplete Delivery or Unavailable Tool**:
-   - If `delivery.complete` is `false`, read any omitted Rule `viking://` URIs via `read` before proceeding.
-   - If `rule_search` fails or is unavailable on the server, note that compiled Rule verification could not run rather than claiming zero rules apply.
+4. **Check the Delivery Before Relying on the Result**:
+   - `delivery` carries `complete`, `rule_count` and `rendered_chars`. `complete: true` means the matched Rules were delivered whole, not that the whole library was searched; an empty result is not a compliance verdict.
+   - `complete: false` means some matched Rules are missing from `rendered`. `read` the `uri` of every entry in `rules` that `rendered` does not contain, in bounded sections, before acting. Do not repeat an identical oversized search, and do not treat the delivered subset as a complete check. If the remaining Rules cannot be retrieved, report the incomplete check and pause the action.
+   - `judge: "pass"` with a `warning` means the server could not judge applicability: every candidate came back with `probability` 1.0, so check each Rule's `applies_when` and `exception` yourself.
+   - A failed or unavailable `rule_search` is not "no Rules apply". HTTP 422 means a blank `task_context`, one over 64,000 characters, or a threshold outside 0 to 1: fix the request. Otherwise note that compiled Rule verification could not run instead of substituting `find` or `search`.
 5. **Re-check on Scope Shift**:
    - Re-run `rule_search` if your implementation plan expands into a new subsystem, external protocol, or deployment configuration.
+   - After `/compact`, earlier Rule results may be gone from the context: search again for the current task.

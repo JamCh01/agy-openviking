@@ -328,33 +328,18 @@ pub fn resolve_git_peer(start_dir: &Path, home_dir: Option<&Path>) -> Option<Pee
                 }
             }
 
-            // Fallback to normalized main repository root directory name when `origin` is absent.
-            let fallback_base = if git_info
-                .common_dir
-                .file_name()
-                .is_some_and(|name| name == ".git")
-            {
-                git_info
-                    .common_dir
-                    .parent()
-                    .and_then(|parent| parent.file_name())
-                    .and_then(|name| name.to_str())
-            } else {
-                current.file_name().and_then(|name| name.to_str())
-            };
-
-            if let Some(dir_name) = fallback_base {
-                let peer_id = sanitize_peer_id(&dir_name.to_ascii_lowercase());
-                if !peer_id.is_empty() {
-                    return Some(PeerResolution {
-                        peer_id,
-                        repo_root: current.to_path_buf(),
-                        common_git_dir: git_info.common_dir,
-                        remote_normalized: None,
-                        is_worktree: git_info.is_worktree,
-                        source: "git_dir_name",
-                    });
-                }
+            // Without `origin`, upstream's `{git_root}` names the peer after the checkout path,
+            // so two unrelated repositories that share a directory name never share memories.
+            let peer_id = legacy_sanitize(&current.to_string_lossy());
+            if !peer_id.trim_matches('-').is_empty() {
+                return Some(PeerResolution {
+                    peer_id,
+                    repo_root: current.to_path_buf(),
+                    common_git_dir: git_info.common_dir,
+                    remote_normalized: None,
+                    is_worktree: git_info.is_worktree,
+                    source: "git_root",
+                });
             }
         }
 
@@ -365,6 +350,18 @@ pub fn resolve_git_peer(start_dir: &Path, home_dir: Option<&Path>) -> Option<Pee
     }
 
     None
+}
+
+/// Upstream's path sanitizer: every character that is not an ASCII letter or digit becomes `-`,
+/// one for one, so `/Users/x/repo` becomes `-Users-x-repo`. `peer.source` templates
+/// (`{git_root}`, `{cwd}`) depend on this exact mapping, shared with the Codex and Claude Code
+/// plugins.
+#[must_use]
+pub fn legacy_sanitize(value: &str) -> String {
+    value
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect()
 }
 
 /// Finds the nearest enclosing workspace root directory (`.git` or `.openviking/config*.json`).
@@ -505,13 +502,26 @@ mod tests {
         let wt_peer =
             resolve_git_peer(&worktree_dir, None).expect("worktree fallback peer should exist");
 
+        let canonical_main = fs::canonicalize(&main_repo).unwrap();
         assert_eq!(
-            main_peer.peer_id, "my_local_repo",
-            "fallback peer should use repo basename"
+            main_peer.peer_id,
+            legacy_sanitize(&canonical_main.to_string_lossy()),
+            "fallback peer should be the sanitized checkout path, as upstream's {{git_root}}"
         );
+        assert!(main_peer.peer_id.ends_with("-My-Local-Repo"));
+        assert_eq!(main_peer.source, "git_root");
+        let canonical_wt = fs::canonicalize(&worktree_dir).unwrap();
         assert_eq!(
-            wt_peer.peer_id, "my_local_repo",
-            "worktree without origin should share main repo basename peer"
+            wt_peer.peer_id,
+            legacy_sanitize(&canonical_wt.to_string_lossy()),
+            "each checkout without origin is its own peer"
         );
+        assert_ne!(main_peer.peer_id, wt_peer.peer_id);
+    }
+
+    #[test]
+    fn legacy_sanitize_maps_each_character_one_for_one() {
+        assert_eq!(legacy_sanitize("/Users/x/My Repo"), "-Users-x-My-Repo");
+        assert_eq!(legacy_sanitize("a..b"), "a--b");
     }
 }

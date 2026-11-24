@@ -1,5 +1,6 @@
 //! Lifecycle hook implementations for Google Antigravity CLI (`agy`).
 
+pub mod post_invocation;
 pub mod pre_invocation;
 pub mod pre_tool;
 pub mod session_start;
