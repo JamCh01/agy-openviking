@@ -383,6 +383,8 @@ pub struct ConversationState {
     #[serde(default)]
     pub last_recall_hash: Option<String>,
     #[serde(default)]
+    pub last_recall_query_hash: Option<String>,
+    #[serde(default)]
     pub last_recall_at_ms: Option<u64>,
     #[serde(default)]
     pub last_byte_offset: u64,

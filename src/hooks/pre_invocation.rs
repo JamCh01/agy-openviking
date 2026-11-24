@@ -12,6 +12,7 @@ use crate::hooks::transcript::{self, LatestUserTurn};
 use crate::wire::{InjectOutput, LastRecallSnapshot, PreInvocationInput};
 
 const PRE_INVOCATION_BUDGET: Duration = Duration::from_millis(4200);
+const STATE_LOCK_BUDGET: Duration = Duration::from_millis(150);
 
 /// Executes `PreInvocation` with turn-level SHA-256 deduplication to preserve prompt cache hits.
 pub async fn run(raw_stdin: &str) -> InjectOutput {
@@ -72,10 +73,16 @@ async fn run_inner(raw_stdin: &str) -> InjectOutput {
     };
 
     let turn_hash = compute_turn_dedup_hash(conversation_id, turn.byte_offset, &turn.text);
+    let query_hash = compute_turn_dedup_hash(conversation_id, 0, &turn.text);
 
     // Turn-level deduplication: skip network I/O on inner tool-loop steps (`invocationNum` > 1).
     let existing_state = config::load_conversation_state(&cfg, conversation_id);
-    if existing_state.last_recall_hash.as_deref() == Some(turn_hash.as_str()) {
+    let fallback_inner_loop_match = turn.byte_offset == 0
+        && parsed.invocation_num.unwrap_or(1) > 1
+        && existing_state.last_recall_query_hash.as_deref() == Some(query_hash.as_str());
+    if existing_state.last_recall_hash.as_deref() == Some(turn_hash.as_str())
+        || fallback_inner_loop_match
+    {
         cfg.log_debug(
             "hook.pre_invocation",
             "dedup_skip",
@@ -91,13 +98,19 @@ async fn run_inner(raw_stdin: &str) -> InjectOutput {
     let compiled_filters = config::compile_input_filters(&cfg.recall_query_filters);
     let filtered = config::apply_input_filters(&turn.text, &compiled_filters, "user");
     if filtered.dropped || filtered.text.chars().count() < cfg.min_query_length {
-        let _ = config::update_conversation_state(&cfg, conversation_id, |state| {
-            state.last_recall_hash = Some(turn_hash.clone());
-            state.last_recall_at_ms = Some(config::now_epoch_ms());
-            if !cfg.peer_id.is_empty() {
-                state.peer_id = Some(cfg.peer_id.clone());
-            }
-        });
+        let _ = config::update_conversation_state_with_budget(
+            &cfg,
+            conversation_id,
+            STATE_LOCK_BUDGET,
+            |state| {
+                state.last_recall_hash = Some(turn_hash.clone());
+                state.last_recall_query_hash = Some(query_hash.clone());
+                state.last_recall_at_ms = Some(config::now_epoch_ms());
+                if !cfg.peer_id.is_empty() {
+                    state.peer_id = Some(cfg.peer_id.clone());
+                }
+            },
+        );
         cfg.log_debug(
             "hook.pre_invocation",
             "query_filtered_or_short",
@@ -129,13 +142,19 @@ async fn run_inner(raw_stdin: &str) -> InjectOutput {
     };
 
     let now_ms = config::now_epoch_ms();
-    let _ = config::update_conversation_state(&cfg, conversation_id, |state| {
-        state.last_recall_hash = Some(turn_hash);
-        state.last_recall_at_ms = Some(now_ms);
-        if !cfg.peer_id.is_empty() {
-            state.peer_id = Some(cfg.peer_id.clone());
-        }
-    });
+    let _ = config::update_conversation_state_with_budget(
+        &cfg,
+        conversation_id,
+        STATE_LOCK_BUDGET,
+        |state| {
+            state.last_recall_hash = Some(turn_hash);
+            state.last_recall_query_hash = Some(query_hash);
+            state.last_recall_at_ms = Some(now_ms);
+            if !cfg.peer_id.is_empty() {
+                state.peer_id = Some(cfg.peer_id.clone());
+            }
+        },
+    );
 
     let formatted_block = recalled
         .as_deref()

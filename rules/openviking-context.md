@@ -7,7 +7,7 @@ description: OpenViking virtual filesystem, context tags, and memory tool usage 
 
 1. **Virtual URI Boundary (`viking://`)**:
    - Paths starting with `viking://` reside in the OpenViking virtual filesystem, **never** on the local OS disk.
-   - Never pass `viking://` URIs to local filesystem or shell tools (`view_file`, `write_to_file`, `replace_file_content`, `multi_replace_file_content`, `list_dir`, `grep_search`, or `run_command`). Always use OpenViking MCP tools (`read`, `ls`, `tree`, `find`, `search`, `grep`, `glob`, `add_resource`, `add_skill`).
+   - Never pass `viking://` URIs to local filesystem or shell tools (`view_file`, `read_file`, `write_to_file`, `write_file`, `replace_file_content`, `multi_replace_file_content`, `edit_file`, `list_dir`, `grep_search`, `find_by_name`, or `run_command`). Always use OpenViking MCP tools (`read`, `ls`, `tree`, `find`, `search`, `grep`, `glob`, `add_resource`, `add_skill`).
 2. **Home-Alias Addressing (`viking://~`)**:
    - Address private user roots via the home alias (`viking://~/memories`, `viking://~/resources`, `viking://~/skills`, `viking://~/sessions`), and account-shared roots via `viking://resources` or `viking://agent/skills`.
    - Never fabricate `viking://user/default/...` or uid-less `viking://user/memories` URIs. When expanding a hit returned by OpenViking, pass its canonical `viking://` URI verbatim.

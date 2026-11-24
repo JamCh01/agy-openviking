@@ -68,13 +68,15 @@ fn main() {
     }
 }
 
+const MAX_HOOK_STDIN_BYTES: u64 = 16 * 1024 * 1024;
+
 fn build_single_thread_runtime() -> io::Result<Runtime> {
     Builder::new_current_thread().enable_all().build()
 }
 
 fn read_stdin_string() -> String {
     let mut buf = Vec::new();
-    let _ = io::stdin().read_to_end(&mut buf);
+    let _ = io::stdin().take(MAX_HOOK_STDIN_BYTES).read_to_end(&mut buf);
     String::from_utf8_lossy(&buf).into_owned()
 }
 

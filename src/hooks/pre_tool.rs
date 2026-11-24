@@ -111,5 +111,32 @@ mod tests {
             PreToolOutput::ask(),
             "mutating local tool should preserve user permission policy via decision=ask"
         );
+
+        let cli_read_deny = run_sync(
+            r#"{"toolCall":{"id":"4","name":"read_file","args":{"Path":"viking://resources/spec.md"}}}"#,
+        );
+        assert_eq!(
+            cli_read_deny,
+            PreToolOutput::deny(VIKING_DENY_REASON),
+            "CLI read_file targeting viking:// must be denied"
+        );
+
+        let cli_edit_deny = run_sync(
+            r#"{"toolCall":{"id":"5","name":"edit_file","args":{"Path":"viking://~/memories/note.md","Target":"a","Replacement":"b"}}}"#,
+        );
+        assert_eq!(
+            cli_edit_deny,
+            PreToolOutput::deny(VIKING_DENY_REASON),
+            "CLI edit_file targeting viking:// must be denied"
+        );
+
+        let cli_write_ask = run_sync(
+            r#"{"toolCall":{"id":"6","name":"write_file","args":{"Path":"/tmp/out.md","Content":"ok"}}}"#,
+        );
+        assert_eq!(
+            cli_write_ask,
+            PreToolOutput::ask(),
+            "CLI write_file on local path should return decision=ask"
+        );
     }
 }

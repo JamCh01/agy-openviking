@@ -235,7 +235,7 @@ All `agy` hook payloads use `camelCase` JSON on `stdin` and expect a single JSON
     ```
   - Read-only local tools (`view_file`, `list_dir`, `grep_search`, `read_file`, `find_by_name`):
     `{"decision": "allow"}`
-  - Write/edit or other tools (`write_to_file`, `replace_file_content`, `multi_replace_file_content`, etc.):
+  - Write/edit or other tools (`write_to_file`, `write_file`, `replace_file_content`, `multi_replace_file_content`, `edit_file`, etc.):
     `{"decision": "ask"}`
   - **Never** output `{}` for `PreToolUse`.
 

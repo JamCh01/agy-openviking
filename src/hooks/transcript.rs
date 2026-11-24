@@ -1,7 +1,7 @@
 //! Antigravity `transcript.jsonl` tail reader, incremental cursor reader, and sanitizer.
 
 use std::fs::File;
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::Path;
 use std::sync::OnceLock;
 
@@ -11,8 +11,11 @@ use serde_json::{Map, Value};
 
 use crate::config::{self, CompiledFilter};
 
-/// Trailing byte window (`64 KiB`) read by `PreInvocation` to avoid scanning multi-MB transcripts.
+/// Initial trailing byte window (`64 KiB`) read by `PreInvocation` for fast tail extraction.
 pub const TAIL_SEEK_WINDOW_BYTES: u64 = 64 * 1024;
+
+/// Maximum backward expansion window (`2 MiB`) when large intermediate tool outputs exceed `64 KiB`.
+const MAX_TAIL_SCAN_BYTES: u64 = 2 * 1024 * 1024;
 
 /// Latest user turn located near the tail of `transcript.jsonl`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -144,8 +147,9 @@ pub fn sanitize_turn_text(
     }
 }
 
-/// Seeks only to the trailing `64 KiB` of `transcript.jsonl` to extract the latest user message
-/// and its exact byte offset in the transcript file.
+/// Seeks to the trailing `64 KiB` of `transcript.jsonl` (expanding up to `2 MiB` when a large
+/// intermediate tool output exceeds `64 KiB`) to extract the latest user message and its exact
+/// byte offset in the transcript file.
 #[must_use]
 pub fn extract_latest_user_turn_tail(path: &Path) -> Option<LatestUserTurn> {
     let mut file = File::open(path).ok()?;
@@ -154,7 +158,24 @@ pub fn extract_latest_user_turn_tail(path: &Path) -> Option<LatestUserTurn> {
         return None;
     }
 
-    let seek_start = file_len.saturating_sub(TAIL_SEEK_WINDOW_BYTES);
+    for window in [TAIL_SEEK_WINDOW_BYTES, MAX_TAIL_SCAN_BYTES] {
+        if let Some(found) = scan_latest_user_turn_in_window(&mut file, file_len, window) {
+            return Some(found);
+        }
+        if file_len <= window {
+            break;
+        }
+    }
+
+    None
+}
+
+fn scan_latest_user_turn_in_window(
+    file: &mut File,
+    file_len: u64,
+    window_bytes: u64,
+) -> Option<LatestUserTurn> {
+    let seek_start = file_len.saturating_sub(window_bytes);
     file.seek(SeekFrom::Start(seek_start)).ok()?;
 
     let mut buf = Vec::with_capacity((file_len - seek_start) as usize);
@@ -162,10 +183,8 @@ pub fn extract_latest_user_turn_tail(path: &Path) -> Option<LatestUserTurn> {
 
     // Align cleanly on a complete JSONL record boundary when seeking mid-file.
     let slice_offset = if seek_start > 0 {
-        match buf.iter().position(|&b| b == b'\n') {
-            Some(nl_idx) => nl_idx + 1,
-            None => 0,
-        }
+        let nl_idx = buf.iter().position(|&b| b == b'\n')?;
+        nl_idx + 1
     } else {
         0
     };
@@ -209,8 +228,8 @@ pub fn extract_latest_user_turn_tail(path: &Path) -> Option<LatestUserTurn> {
     latest
 }
 
-/// Reads new user and assistant turns from `transcript.jsonl` starting at `start_offset`.
-/// Handles file truncation/compaction safely by resetting to byte `0` if shrunk.
+/// Streams new user and assistant turns line-by-line from `transcript.jsonl` starting at
+/// `start_offset`. Handles file truncation/compaction safely by resetting to byte `0` if shrunk.
 pub fn read_new_turns_from_offset(path: &Path, start_offset: u64) -> Result<TranscriptDelta> {
     let mut file = File::open(path)?;
     let file_len = file.metadata()?.len();
@@ -228,21 +247,21 @@ pub fn read_new_turns_from_offset(path: &Path, start_offset: u64) -> Result<Tran
     }
 
     file.seek(SeekFrom::Start(effective_start))?;
-    let mut buf = Vec::with_capacity((file_len - effective_start) as usize);
-    file.read_to_end(&mut buf)?;
-
+    let mut reader = BufReader::new(file);
+    let mut line_buf = Vec::new();
     let mut turns = Vec::new();
-    let mut consumed = 0usize;
-    let mut cursor = 0usize;
+    let mut consumed = 0u64;
 
-    while cursor < buf.len() {
-        let line_start = cursor;
-        if let Some(rel_nl) = buf[cursor..].iter().position(|&b| b == b'\n') {
-            let line_end = line_start + rel_nl;
-            cursor = line_end + 1;
-            consumed = cursor;
+    loop {
+        line_buf.clear();
+        let bytes_read = reader.read_until(b'\n', &mut line_buf)?;
+        if bytes_read == 0 {
+            break;
+        }
 
-            if let Ok(line_str) = std::str::from_utf8(&buf[line_start..line_end]) {
+        if line_buf.last() == Some(&b'\n') {
+            consumed += bytes_read as u64;
+            if let Ok(line_str) = std::str::from_utf8(&line_buf) {
                 let trimmed = line_str.trim();
                 if !trimmed.is_empty() {
                     if let Some(turn) = parse_transcript_json_line(trimmed) {
@@ -251,15 +270,15 @@ pub fn read_new_turns_from_offset(path: &Path, start_offset: u64) -> Result<Tran
                 }
             }
         } else {
-            if let Ok(line_str) = std::str::from_utf8(&buf[line_start..]) {
+            if let Ok(line_str) = std::str::from_utf8(&line_buf) {
                 let trimmed = line_str.trim();
                 if trimmed.is_empty() {
-                    consumed = buf.len();
+                    consumed += bytes_read as u64;
                 } else if serde_json::from_str::<Value>(trimmed).is_ok() {
                     if let Some(turn) = parse_transcript_json_line(trimmed) {
                         turns.push(turn);
                     }
-                    consumed = buf.len();
+                    consumed += bytes_read as u64;
                 }
             }
             break;
@@ -268,7 +287,7 @@ pub fn read_new_turns_from_offset(path: &Path, start_offset: u64) -> Result<Tran
 
     Ok(TranscriptDelta {
         turns,
-        new_byte_offset: effective_start + (consumed as u64),
+        new_byte_offset: effective_start + consumed,
     })
 }
 
@@ -457,6 +476,36 @@ mod tests {
             turn.byte_offset > 0,
             "byte_offset should record exact file position, got {}",
             turn.byte_offset
+        );
+    }
+
+    #[test]
+    fn tail_seek_expands_past_large_intermediate_tool_result() {
+        let mut tmp = NamedTempFile::new().expect("temp transcript file should be created");
+        writeln!(
+            tmp,
+            r#"{{"step_index":1,"source":"USER_EXPLICIT","type":"USER_INPUT","content":"<USER_REQUEST>\nAudit large file handling\n</USER_REQUEST>"}}"#
+        )
+        .expect("initial user turn should write");
+        tmp.flush().expect("initial user turn should flush");
+
+        let initial_turn =
+            extract_latest_user_turn_tail(tmp.path()).expect("initial user turn must be found");
+
+        // Append a > 80 KiB TOOL_RESULT line so the trailing 64 KiB window contains no USER_INPUT.
+        let large_blob = "x".repeat(80 * 1024);
+        writeln!(
+            tmp,
+            r#"{{"step_index":2,"type":"TOOL_RESULT","content":"{large_blob}"}}"#
+        )
+        .expect("large tool result line should write");
+        tmp.flush().expect("large tool result should flush");
+
+        let after_large_tool = extract_latest_user_turn_tail(tmp.path())
+            .expect("expanded tail scan must still locate prior user turn");
+        assert_eq!(
+            after_large_tool, initial_turn,
+            "byte_offset and text must remain identical across >64 KiB intermediate tool outputs"
         );
     }
 }
