@@ -1,6 +1,6 @@
 //! Bounded offline Write-Ahead Log (`wal/pending.jsonl`) for failed capture requests.
 
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
 use std::time::Duration;
@@ -9,7 +9,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::client::OvClient;
-use crate::config::{self, ResolvedConfig};
+use crate::config::{self, PrivateOpenMode, ResolvedConfig};
 use crate::wire::{OvAddMessageRequest, OvMessagePart};
 
 /// Maximum size (`10 MiB`) of `${STATE_DIR}/wal/pending.jsonl`.
@@ -84,6 +84,7 @@ pub struct ReplayReport {
 pub struct WalStore {
     wal_path: PathBuf,
     lock_path: PathBuf,
+    replay_lock_path: PathBuf,
 }
 
 impl WalStore {
@@ -93,6 +94,7 @@ impl WalStore {
         Self {
             wal_path: cfg.state_dir.join("wal").join("pending.jsonl"),
             lock_path: cfg.lock_file_path("wal"),
+            replay_lock_path: cfg.lock_file_path("wal-replay"),
         }
     }
 
@@ -139,23 +141,35 @@ impl WalStore {
         self.write_lines_atomic_unlocked(&bounded)
     }
 
-    /// Replays queued WAL entries in FIFO order against `client`.
+    /// Replays queued WAL entries in FIFO order against `client` without holding `wal.lock`
+    /// across network `.await` points so concurrent `append` calls never block on slow networks.
     pub async fn replay(&self, client: &OvClient) -> Result<ReplayReport> {
         if !self.wal_path.is_file() {
             return Ok(ReplayReport::default());
         }
 
-        let _guard = config::acquire_exclusive_lock(&self.lock_path, Duration::from_secs(3))?;
-        let raw_lines = self.read_raw_lines_unlocked();
-        if raw_lines.is_empty() {
-            let _ = fs::remove_file(&self.wal_path);
+        // Ensure at most one background worker replays the shared WAL at a time without blocking.
+        let Some(_replay_guard) = config::try_acquire_exclusive_lock(&self.replay_lock_path)?
+        else {
             return Ok(ReplayReport::default());
-        }
+        };
 
-        let mut parsed_entries = Vec::with_capacity(raw_lines.len());
+        let snapshot_lines = {
+            let _data_guard =
+                config::acquire_exclusive_lock(&self.lock_path, Duration::from_secs(3))?;
+            let lines = self.read_raw_lines_unlocked();
+            if lines.is_empty() {
+                let _ = fs::remove_file(&self.wal_path);
+                return Ok(ReplayReport::default());
+            }
+            lines
+        };
+        let snapshot_len = snapshot_lines.len();
+
+        let mut parsed_entries = Vec::with_capacity(snapshot_len);
         let mut dropped = 0usize;
-        for line in raw_lines {
-            match serde_json::from_str::<WalEntry>(&line) {
+        for line in &snapshot_lines {
+            match serde_json::from_str::<WalEntry>(line) {
                 Ok(entry) => parsed_entries.push(entry),
                 Err(_) => dropped += 1,
             }
@@ -181,11 +195,7 @@ impl WalStore {
                 Ok(()) => {
                     replayed += 1;
                 }
-                Err(err) if err.is_retryable() => {
-                    first_unsent_idx = Some(idx);
-                    break;
-                }
-                Err(err) if matches!(err.status_code(), Some(401 | 403)) => {
+                Err(err) if err.should_queue_to_wal() => {
                     first_unsent_idx = Some(idx);
                     break;
                 }
@@ -195,25 +205,43 @@ impl WalStore {
             }
         }
 
+        // Re-acquire the short-lived data lock to merge unsent snapshot entries with any lines
+        // concurrently appended by other conversations while HTTP replay was in flight.
+        let _data_guard = config::acquire_exclusive_lock(&self.lock_path, Duration::from_secs(3))?;
+        let current_lines = self.read_raw_lines_unlocked();
+        let newly_appended: &[String] = if current_lines.len() > snapshot_len
+            && current_lines[..snapshot_len] == snapshot_lines[..]
+        {
+            &current_lines[snapshot_len..]
+        } else if current_lines == snapshot_lines {
+            &[]
+        } else {
+            // WAL was rotated/capped concurrently while exceeds `MAX_WAL_BYTES`; preserve current tail.
+            &current_lines
+        };
+
+        let mut merged = Vec::new();
         if let Some(unsent_start) = first_unsent_idx {
-            let remaining_slice = &parsed_entries[unsent_start..];
-            let mut serialized = Vec::with_capacity(remaining_slice.len());
-            for item in remaining_slice {
-                serialized.push(serde_json::to_string(item)?);
+            for item in &parsed_entries[unsent_start..] {
+                merged.push(serde_json::to_string(item)?);
             }
-            let bounded = enforce_byte_cap(serialized, MAX_WAL_BYTES as usize);
+        }
+        merged.extend(newly_appended.iter().cloned());
+
+        if merged.is_empty() {
+            let _ = fs::remove_file(&self.wal_path);
+            Ok(ReplayReport {
+                replayed,
+                remaining: 0,
+                dropped,
+            })
+        } else {
+            let bounded = enforce_byte_cap(merged, MAX_WAL_BYTES as usize);
             let remaining = bounded.len();
             self.write_lines_atomic_unlocked(&bounded)?;
             Ok(ReplayReport {
                 replayed,
                 remaining,
-                dropped,
-            })
-        } else {
-            let _ = fs::remove_file(&self.wal_path);
-            Ok(ReplayReport {
-                replayed,
-                remaining: 0,
                 dropped,
             })
         }
@@ -240,31 +268,36 @@ impl WalStore {
             return Ok(());
         }
         if let Some(parent) = self.wal_path.parent() {
-            fs::create_dir_all(parent)
+            config::ensure_private_dir(parent)
                 .with_context(|| format!("failed creating WAL directory {}", parent.display()))?;
         }
         let tmp_path = self
             .wal_path
             .with_extension(format!("jsonl.tmp.{}", std::process::id()));
-        {
-            let mut temp_file = OpenOptions::new()
-                .create(true)
-                .write(true)
-                .truncate(true)
-                .open(&tmp_path)
-                .with_context(|| format!("failed opening temp WAL {}", tmp_path.display()))?;
+        let write_res = (|| -> Result<()> {
+            let mut temp_file =
+                config::open_private_file(&tmp_path, PrivateOpenMode::TruncateWrite)
+                    .with_context(|| format!("failed opening temp WAL {}", tmp_path.display()))?;
             for line in lines {
                 writeln!(temp_file, "{line}")?;
             }
             temp_file.sync_all()?;
+            Ok(())
+        })();
+        if let Err(err) = write_res {
+            let _ = fs::remove_file(&tmp_path);
+            return Err(err);
         }
-        fs::rename(&tmp_path, &self.wal_path).with_context(|| {
-            format!(
-                "failed atomically updating WAL {} -> {}",
-                tmp_path.display(),
-                self.wal_path.display()
-            )
-        })?;
+        if let Err(err) = fs::rename(&tmp_path, &self.wal_path) {
+            let _ = fs::remove_file(&tmp_path);
+            return Err(err).with_context(|| {
+                format!(
+                    "failed atomically updating WAL {} -> {}",
+                    tmp_path.display(),
+                    self.wal_path.display()
+                )
+            });
+        }
         Ok(())
     }
 }

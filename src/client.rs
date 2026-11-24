@@ -36,13 +36,15 @@ pub enum ClientError {
 }
 
 impl ClientError {
-    /// Returns `true` for transient failures (network errors, HTTP 429, or HTTP 5xx)
-    /// that should be queued in the offline WAL for later replay.
+    /// Returns `true` when a failed session write should be preserved in the offline WAL
+    /// (network/timeout errors, HTTP 401/403 credential errors awaiting remediation, HTTP 429, or 5xx).
     #[must_use]
-    pub fn is_retryable(&self) -> bool {
+    pub fn should_queue_to_wal(&self) -> bool {
         match self {
             ClientError::Transport(_) => true,
-            ClientError::HttpStatus { status, .. } => *status == 429 || *status >= 500,
+            ClientError::HttpStatus { status, .. } => {
+                matches!(*status, 401 | 403 | 429) || *status >= 500
+            }
             ClientError::InvalidJson(_) => false,
         }
     }

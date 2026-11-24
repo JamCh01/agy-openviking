@@ -145,7 +145,7 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
                         Ok(()) => {
                             uncommitted = 0;
                         }
-                        Err(err) if err.is_retryable() => {
+                        Err(err) if err.should_queue_to_wal() => {
                             send_failed_to_offline = true;
                             wal_batch.push(WalEntry::commit(&ov_session_id));
                             uncommitted = 0;
@@ -160,7 +160,7 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
                     }
                 }
             }
-            Err(err) if err.is_retryable() => {
+            Err(err) if err.should_queue_to_wal() => {
                 cfg.log_debug(
                     "worker",
                     "queueing_to_wal",

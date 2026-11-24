@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
-use std::io::Write;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -706,9 +706,9 @@ pub fn append_debug_jsonl(log_path: &Path, component: &str, stage: &str, detail:
     entry.insert("stage".to_string(), json!(stage));
     entry.insert("detail".to_string(), detail);
     if let Some(parent) = log_path.parent() {
-        let _ = fs::create_dir_all(parent);
+        let _ = ensure_private_dir(parent);
     }
-    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(log_path) {
+    if let Ok(mut file) = open_private_file(log_path, PrivateOpenMode::Append) {
         if let Ok(serialized) = serde_json::to_string(&entry) {
             let _ = writeln!(file, "{serialized}");
         }
@@ -807,20 +807,83 @@ impl Drop for AdvisoryLock {
     }
 }
 
+/// Write disposition when opening a private (`0600`) plugin state, lock, or log file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrivateOpenMode {
+    Append,
+    ReadWriteKeep,
+    TruncateWrite,
+}
+
+/// Creates `dir` (and parents) and restricts permissions to `0700` on Unix when newly created.
+pub fn ensure_private_dir(dir: &Path) -> io::Result<()> {
+    let existed = dir.exists();
+    fs::create_dir_all(dir)?;
+    #[cfg(unix)]
+    if !existed {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(dir, fs::Permissions::from_mode(0o700));
+    }
+    #[cfg(not(unix))]
+    let _ = existed;
+    Ok(())
+}
+
+/// Opens or creates a private (`0600` on Unix) file according to `mode`.
+pub fn open_private_file(path: &Path, mode: PrivateOpenMode) -> io::Result<File> {
+    let mut opts = OpenOptions::new();
+    opts.create(true).write(true);
+    match mode {
+        PrivateOpenMode::Append => {
+            opts.append(true);
+        }
+        PrivateOpenMode::ReadWriteKeep => {
+            opts.read(true).truncate(false);
+        }
+        PrivateOpenMode::TruncateWrite => {
+            opts.read(true).truncate(true);
+        }
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let file = opts.open(path)?;
+    #[cfg(unix)]
+    if mode == PrivateOpenMode::TruncateWrite {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = file.set_permissions(fs::Permissions::from_mode(0o600));
+    }
+    Ok(file)
+}
+
+/// Acquires an exclusive advisory file lock immediately without blocking, returning `Ok(None)` if contended.
+pub fn try_acquire_exclusive_lock(lock_path: &Path) -> Result<Option<AdvisoryLock>> {
+    use fs4::fs_std::FileExt;
+
+    if let Some(parent) = lock_path.parent() {
+        ensure_private_dir(parent)
+            .with_context(|| format!("failed to create lock directory {}", parent.display()))?;
+    }
+    let file = open_private_file(lock_path, PrivateOpenMode::ReadWriteKeep)
+        .with_context(|| format!("failed to open lock file {}", lock_path.display()))?;
+
+    match FileExt::try_lock_exclusive(&file) {
+        Ok(()) => Ok(Some(AdvisoryLock { file })),
+        Err(_) => Ok(None),
+    }
+}
+
 /// Acquires an exclusive advisory file lock on `lock_path` within `wait_budget`.
 pub fn acquire_exclusive_lock(lock_path: &Path, wait_budget: Duration) -> Result<AdvisoryLock> {
     use fs4::fs_std::FileExt;
 
     if let Some(parent) = lock_path.parent() {
-        fs::create_dir_all(parent)
+        ensure_private_dir(parent)
             .with_context(|| format!("failed to create lock directory {}", parent.display()))?;
     }
-    let file = OpenOptions::new()
-        .create(true)
-        .read(true)
-        .write(true)
-        .truncate(false)
-        .open(lock_path)
+    let file = open_private_file(lock_path, PrivateOpenMode::ReadWriteKeep)
         .with_context(|| format!("failed to open lock file {}", lock_path.display()))?;
 
     let start = Instant::now();
@@ -845,28 +908,32 @@ pub fn acquire_exclusive_lock(lock_path: &Path, wait_budget: Duration) -> Result
 /// Atomically serializes `value` as JSON via temporary file write + `sync_all()` + `rename`.
 pub fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
+        ensure_private_dir(parent)
             .with_context(|| format!("failed creating parent directory {}", parent.display()))?;
     }
     let serialized = serde_json::to_vec_pretty(value)?;
     let tmp_path = path.with_extension(format!("json.tmp.{}", std::process::id()));
-    {
-        let mut temp_file = OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(&tmp_path)
+    let write_res = (|| -> Result<()> {
+        let mut temp_file = open_private_file(&tmp_path, PrivateOpenMode::TruncateWrite)
             .with_context(|| format!("failed creating temp file {}", tmp_path.display()))?;
         temp_file.write_all(&serialized)?;
         temp_file.sync_all()?;
+        Ok(())
+    })();
+    if let Err(err) = write_res {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(err);
     }
-    fs::rename(&tmp_path, path).with_context(|| {
-        format!(
-            "failed renaming {} -> {}",
-            tmp_path.display(),
-            path.display()
-        )
-    })?;
+    if let Err(err) = fs::rename(&tmp_path, path) {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(err).with_context(|| {
+            format!(
+                "failed renaming {} -> {}",
+                tmp_path.display(),
+                path.display()
+            )
+        });
+    }
     Ok(())
 }
 
@@ -885,7 +952,7 @@ pub fn load_conversation_state(cfg: &ResolvedConfig, conversation_id: &str) -> C
         .unwrap_or_else(|| ConversationState::new(conversation_id))
 }
 
-/// Atomically mutates `ConversationState` under an exclusive advisory lock.
+/// Atomically mutates `ConversationState` under an exclusive advisory lock (`2s` default wait).
 pub fn update_conversation_state<F>(
     cfg: &ResolvedConfig,
     conversation_id: &str,
@@ -894,8 +961,21 @@ pub fn update_conversation_state<F>(
 where
     F: FnOnce(&mut ConversationState),
 {
+    update_conversation_state_with_budget(cfg, conversation_id, Duration::from_secs(2), mutate)
+}
+
+/// Atomically mutates `ConversationState` under an exclusive advisory lock with an explicit `wait_budget`.
+pub fn update_conversation_state_with_budget<F>(
+    cfg: &ResolvedConfig,
+    conversation_id: &str,
+    wait_budget: Duration,
+    mutate: F,
+) -> Result<ConversationState>
+where
+    F: FnOnce(&mut ConversationState),
+{
     let lock_path = cfg.lock_file_path(&format!("state-{conversation_id}"));
-    let _guard = acquire_exclusive_lock(&lock_path, Duration::from_secs(2))?;
+    let _guard = acquire_exclusive_lock(&lock_path, wait_budget)?;
     let state_path = cfg.state_file_path(conversation_id);
     let mut state = read_json_optional::<ConversationState>(&state_path)
         .unwrap_or_else(|| ConversationState::new(conversation_id));
@@ -1487,5 +1567,30 @@ mod tests {
 
         let dropped = apply_input_filters("/clear", &rules, "user");
         assert!(dropped.dropped, "drop filter should match /clear command");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn creates_private_0600_files_and_0700_dirs() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp_dir = TempDir::new().expect("tempdir should be created");
+        let nested_state = temp_dir.path().join("private-state").join("conv.json");
+        write_json_atomic(&nested_state, &json!({"ok": true}))
+            .expect("atomic private json write should succeed");
+
+        let dir_mode = fs::metadata(temp_dir.path().join("private-state"))
+            .expect("state dir metadata should read")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(dir_mode, 0o700, "newly created state dir must be 0700");
+
+        let file_mode = fs::metadata(&nested_state)
+            .expect("state file metadata should read")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(file_mode, 0o600, "atomic state file must be 0600");
     }
 }
