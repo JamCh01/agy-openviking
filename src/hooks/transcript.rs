@@ -2,7 +2,7 @@
 
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 use anyhow::Result;
@@ -21,6 +21,9 @@ const MAX_TAIL_SCAN_BYTES: u64 = 2 * 1024 * 1024;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LatestUserTurn {
     pub byte_offset: u64,
+    pub step_index: Option<u64>,
+    pub answered: bool,
+    pub truncated: bool,
     pub text: String,
 }
 
@@ -151,7 +154,10 @@ pub fn sanitize_turn_text(
 /// intermediate tool output exceeds `64 KiB`) to extract the latest user message and its exact
 /// byte offset in the transcript file.
 #[must_use]
-pub fn extract_latest_user_turn_tail(path: &Path) -> Option<LatestUserTurn> {
+pub fn extract_latest_user_turn_tail(
+    path: &Path,
+    before_step: Option<u64>,
+) -> Option<LatestUserTurn> {
     let mut file = File::open(path).ok()?;
     let file_len = file.metadata().ok()?.len();
     if file_len == 0 {
@@ -159,7 +165,9 @@ pub fn extract_latest_user_turn_tail(path: &Path) -> Option<LatestUserTurn> {
     }
 
     for window in [TAIL_SEEK_WINDOW_BYTES, MAX_TAIL_SCAN_BYTES] {
-        if let Some(found) = scan_latest_user_turn_in_window(&mut file, file_len, window) {
+        if let Some(found) =
+            scan_latest_user_turn_in_window(&mut file, file_len, window, before_step)
+        {
             return Some(found);
         }
         if file_len <= window {
@@ -174,6 +182,7 @@ fn scan_latest_user_turn_in_window(
     file: &mut File,
     file_len: u64,
     window_bytes: u64,
+    before_step: Option<u64>,
 ) -> Option<LatestUserTurn> {
     let seek_start = file_len.saturating_sub(window_bytes);
     file.seek(SeekFrom::Start(seek_start)).ok()?;
@@ -212,13 +221,33 @@ fn scan_latest_user_turn_in_window(
             continue;
         }
 
-        if let Some(turn) = parse_transcript_json_line(trimmed) {
+        let Ok(record) = serde_json::from_str::<Value>(trimmed) else {
+            continue;
+        };
+        let step_index = record["step_index"].as_u64();
+        if before_step
+            .zip(step_index)
+            .is_some_and(|(limit, step)| limit > 0 && step >= limit)
+        {
+            break;
+        }
+        if record["source"] == "MODEL" {
+            if let Some(ref mut user) = latest {
+                user.answered = true;
+            }
+        }
+        if let Some(turn) = parse_transcript_record(&record) {
             if turn.role == "user" {
                 let cleaned = strip_injected_blocks(&turn.text);
                 if !cleaned.is_empty() {
                     latest = Some(LatestUserTurn {
                         byte_offset: seek_start + (line_start as u64),
                         text: cleaned,
+                        step_index,
+                        answered: false,
+                        truncated: record["truncated_fields"]
+                            .as_array()
+                            .is_some_and(|fields| fields.iter().any(|f| f == "content")),
                     });
                 }
             }
@@ -228,8 +257,41 @@ fn scan_latest_user_turn_in_window(
     latest
 }
 
-/// Streams new user and assistant turns line-by-line from `transcript.jsonl` starting at
-/// `start_offset`. Handles file truncation/compaction safely by resetting to byte `0` if shrunk.
+/// Both host transcripts enumerate the same steps. Byte offsets differ if a field was shortened.
+pub fn preferred_transcript(path: &Path) -> PathBuf {
+    let full = path.with_file_name("transcript_full.jsonl");
+    if path
+        .file_name()
+        .is_some_and(|name| name == "transcript.jsonl")
+        && full.is_file()
+    {
+        full
+    } else {
+        path.to_owned()
+    }
+}
+
+/// Map an old byte cursor between the short and full serializations at a record boundary.
+pub fn translate_cursor(old: &Path, new: &Path, offset: u64) -> Result<u64> {
+    let old_file = File::open(old)?;
+    let mut previous = BufReader::new(old_file.take(offset));
+    let mut next = BufReader::new(File::open(new)?);
+    let mut buf = Vec::new();
+    let mut new_offset = 0;
+    while previous.read_until(b'\n', &mut buf)? > 0 {
+        buf.clear();
+        let size = next.read_until(b'\n', &mut buf)?;
+        anyhow::ensure!(
+            size > 0,
+            "full transcript has not caught up with saved cursor"
+        );
+        new_offset += size as u64;
+        buf.clear();
+    }
+    Ok(new_offset)
+}
+
+/// Reads finished transcript records and leaves an in-progress message for the next Stop.
 pub fn read_new_turns_from_offset(path: &Path, start_offset: u64) -> Result<TranscriptDelta> {
     let mut file = File::open(path)?;
     let file_len = file.metadata()?.len();
@@ -259,30 +321,30 @@ pub fn read_new_turns_from_offset(path: &Path, start_offset: u64) -> Result<Tran
             break;
         }
 
-        if line_buf.last() == Some(&b'\n') {
-            consumed += bytes_read as u64;
-            if let Ok(line_str) = std::str::from_utf8(&line_buf) {
-                let trimmed = line_str.trim();
-                if !trimmed.is_empty() {
-                    if let Some(turn) = parse_transcript_json_line(trimmed) {
-                        turns.push(turn);
-                    }
+        let complete_line = line_buf.last() == Some(&b'\n');
+        match serde_json::from_slice::<Value>(&line_buf) {
+            Ok(record) => {
+                let capture_step = record["type"] == "PLANNER_RESPONSE"
+                    || (record["type"] == "USER_INPUT"
+                        && record["source"]
+                            .as_str()
+                            .is_none_or(|s| s == "USER_EXPLICIT"));
+                if capture_step
+                    && matches!(
+                        record["status"].as_str(),
+                        Some("PENDING" | "QUEUED" | "WAITING" | "RUNNING" | "GENERATING")
+                    )
+                {
+                    break;
+                }
+                if let Some(turn) = parse_transcript_record(&record) {
+                    turns.push(turn);
                 }
             }
-        } else {
-            if let Ok(line_str) = std::str::from_utf8(&line_buf) {
-                let trimmed = line_str.trim();
-                if trimmed.is_empty() {
-                    consumed += bytes_read as u64;
-                } else if serde_json::from_str::<Value>(trimmed).is_ok() {
-                    if let Some(turn) = parse_transcript_json_line(trimmed) {
-                        turns.push(turn);
-                    }
-                    consumed += bytes_read as u64;
-                }
-            }
-            break;
+            Err(_) if !complete_line && !line_buf.iter().all(u8::is_ascii_whitespace) => break,
+            Err(_) => {}
         }
+        consumed += bytes_read as u64;
     }
 
     Ok(TranscriptDelta {
@@ -291,8 +353,13 @@ pub fn read_new_turns_from_offset(path: &Path, start_offset: u64) -> Result<Tran
     })
 }
 
-fn parse_transcript_json_line(line: &str) -> Option<RawTranscriptTurn> {
-    let obj = serde_json::from_str::<Value>(line).ok()?;
+fn parse_transcript_record(obj: &Value) -> Option<RawTranscriptTurn> {
+    if obj["status"]
+        .as_str()
+        .is_some_and(|status| status != "DONE")
+    {
+        return None;
+    }
     let map = obj.as_object()?;
 
     if let Some(source) = map.get("source").and_then(Value::as_str) {
@@ -304,6 +371,13 @@ fn parse_transcript_json_line(line: &str) -> Option<RawTranscriptTurn> {
     if let Some(step_type) = map.get("type").and_then(Value::as_str) {
         match step_type {
             "USER_INPUT" => {
+                if map
+                    .get("source")
+                    .and_then(Value::as_str)
+                    .is_some_and(|s| s != "USER_EXPLICIT")
+                {
+                    return None;
+                }
                 let text = extract_text_from_record(map)?;
                 return Some(RawTranscriptTurn {
                     role: "user".to_string(),
@@ -466,7 +540,7 @@ mod tests {
             "test fixture must exceed 64 KiB to exercise tail seeking, got {meta_len}"
         );
 
-        let turn = extract_latest_user_turn_tail(tmp.path())
+        let turn = extract_latest_user_turn_tail(tmp.path(), None)
             .expect("latest user turn should be found in trailing 64 KiB");
         assert_eq!(
             turn.text, "Final tail prompt",
@@ -489,8 +563,8 @@ mod tests {
         .expect("initial user turn should write");
         tmp.flush().expect("initial user turn should flush");
 
-        let initial_turn =
-            extract_latest_user_turn_tail(tmp.path()).expect("initial user turn must be found");
+        let initial_turn = extract_latest_user_turn_tail(tmp.path(), None)
+            .expect("initial user turn must be found");
 
         // Append a > 80 KiB TOOL_RESULT line so the trailing 64 KiB window contains no USER_INPUT.
         let large_blob = "x".repeat(80 * 1024);
@@ -501,7 +575,7 @@ mod tests {
         .expect("large tool result line should write");
         tmp.flush().expect("large tool result should flush");
 
-        let after_large_tool = extract_latest_user_turn_tail(tmp.path())
+        let after_large_tool = extract_latest_user_turn_tail(tmp.path(), None)
             .expect("expanded tail scan must still locate prior user turn");
         assert_eq!(
             after_large_tool, initial_turn,

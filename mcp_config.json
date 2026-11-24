@@ -6,7 +6,6 @@
         "${PLUGIN_ROOT}/scripts/ov-agy",
         "mcp-proxy"
       ],
-      "cwd": "${PLUGIN_ROOT}",
       "env": {
         "OPENVIKING_PLUGIN_DATA": "${PLUGIN_DATA}"
       }

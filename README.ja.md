@@ -34,22 +34,24 @@
 `agy-openviking`（`ov-agy`）は、**Node.js や Python ランタイムへの依存が一切ない** ネイティブ Rust シングルバイナリとして、OpenViking を Google Antigravity CLI（`agy`）の 5 つの拡張ピラー（**MCP サーバー + ライフサイクルフック + サブエージェント + スキル + 常駐ルール**）にブリッジします。
 
 - **サブミリ秒の同期高速パスとフェイルオープン（Fail-Open）設計**：高頻度で呼ばれるライフサイクルフック（`PreToolUse` および `Stop`）は非同期ランタイムを起動せず `< 1 ms` で同期実行されます。すべてのフックでネットワークタイムアウトや設定エラーを捕捉し、終了コード `0` と安全なフォールバック JSON を返すため、OpenViking サーバー停止時でも `agy` 本体の動作を決してブロックしません。
-- **プロンプトキャッシュを守るターン単位の重複排除**：`PreInvocation` は `transcript.jsonl` 末尾の `64 KiB` のみをシークして `(conversationId, turn_offset, query)` のハッシュを計算し、ユーザーの 1 ターンにつき 1 回だけ `mode: "context"` 検索を実行します。同一ターン内のツール呼び出しループ（`invocationNum > 1`）ではネットワーク通信ゼロで `{}` を返し、プロンプトキャッシュのヒット率を維持します。
+- **ユーザーターン単位の重複排除。** 最初のモデル呼び出しで現在の入力とステップを照合します。ツールループ（`invocationNum > 0`）とモデル応答後のバックグラウンド再開では検索を省略します。
 - **Git ワークツリー対応のリポジトリ単位 Peer 正規化**：リンクされた Git ワークツリー（`.git` ファイル内の `gitdir:` と `commondir`）から共有 `.git/config` を辿り、SSH（`git@github.com:Org/Repo.git`）と HTTPS（`https://github.com/Org/Repo.git`）の `origin` URL を同一のリポジトリ `peer` ID に正規化します。
-- **自己汚染防止キャプチャとオフライン先行書き込みログ（WAL）**：デタッチされたバックグラウンドプロセス `ov-agy worker` が、`<openviking-context>`・`<openviking-session>`・`<available-skills>` タグを除去してから会話ターンを保存します。サーバー障害時は `fs4` ファイルロック付きのオフライン WAL（`wal/pending.jsonl`、最大 `10 MiB`）へ退避し、復旧後に自動リプレイします。
+- **自己汚染防止キャプチャとオフライン先行書き込みログ（WAL）**：デタッチされたバックグラウンドプロセス `ov-agy worker` が、`<openviking-context>`・`<openviking-session>`・`<available-skills>` タグを除去してから会話ターンを保存します。サーバー障害時は `fs4` ファイルロック付きのオフライン WAL（`wal/<scope>/pending.jsonl`、最大 `10 MiB`）へ退避し、復旧後に自動リプレイします。
 
 ## アーキテクチャとコンポーネント
 
 | コンポーネント | エントリポイント / パス | 役割と責務の境界 |
 | :--- | :--- | :--- |
-| **MCP プロキシ（`mcp-proxy`）** | `ov-agy mcp-proxy`（`mcp_config.json`） | stdio JSON-RPC 2.0 を Streamable HTTP `POST {base_url}/mcp` へ中継し、`application/json` と `text/event-stream`（SSE）の両方に対応。HTTP `404` 発生時には期限切れの `mcp-session-id` を自動で再初期化して復旧します。 |
-| **`SessionStart` フック** | `./scripts/ov-agy hook session-start` | セッション開始時に `/health` と `/api/v1/system/status` を確認し、`viking://~/skills` と `viking://agent/skills` のリモートスキル一覧を取得してセッション状態を 1 回だけ注入します。 |
-| **`PreInvocation` フック** | `./scripts/ov-agy hook pre-invocation` | `transcript.jsonl` 末尾から最新のユーザー入力を抽出し、ターン単位の重複排除を行った上で `POST /api/v1/search/search`（`mode: "context"`）の結果を `<openviking-context>` として注入します。 |
-| **`PreToolUse` フック** | `./scripts/ov-agy hook pre-tool` | `< 1 ms` で動作する同期ガード。`viking://` 仮想 URI がローカルファイル操作ツール（`view_file`、`write_to_file`、`replace_file_content`、`multi_replace_file_content`、`list_dir`、`grep_search`）に誤って渡されるのを即座にブロックします。 |
-| **`Stop` フックと背景 `worker`** | `./scripts/ov-agy hook stop` -> `ov-agy worker` | `fullyIdle == true` のタイミングで `ov-agy worker` をデタッチ起動（`Stdio::null()`）。注入済みタグをサニタイズして `agy-{conversationId}` へ記録し、規定ターンごとに `/commit` を実行、障害時は `wal/pending.jsonl` を読み書きします。 |
+| **MCP プロキシ（`mcp-proxy`）** | `ov-agy mcp-proxy`（`mcp_config.json`） | MCP の `roots/list` で agy のワークスペースを特定し、JSON/SSE リクエストを `{base_url}/mcp` に転送します。セッション期限切れの HTTP 404 で再初期化します。 |
+| **`SessionStart` フック** | `./scripts/ov-agy hook session-start` | 接続を確認し、ユーザーとプロジェクトのプロフィール、設定・エンティティの索引、スキル一覧、既存のセッションアーカイブの概要を注入します。 |
+| **`PreInvocation` フック** | `./scripts/ov-agy hook pre-invocation` | `lastUserInput` とログから現在のターンを判定し、開発用途のコンテキストを検索します。`transcript_full.jsonl` があれば優先します。 |
+| **`PreToolUse` フック** | `./scripts/ov-agy hook pre-tool` | パスが `viking://` で始まるローカルファイル操作を拒否します。ファイル本文や検索語では URI を引用できます。 |
+| **`Stop` フックと背景 `worker`** | `./scripts/ov-agy hook stop` -> `ov-agy worker` | アイドル時に完了したメッセージを `agy-{conversationId}` に送り、残りのバッチをコミットして該当するオフラインキューを再送します。 |
 | **サブエージェント** | `agents/viking-navigator.md` | 読み取り専用のバックグラウンド探索サブエージェント（`inheritMcp: true`、`commandExecutionPolicy: off`）。L0 -> L1 -> L2 の順で `viking://` ツリーを調査し、正確な URI 引用付きの要約だけを親エージェントへ返します。 |
 | **スキル群（`/ov-*`）** | `skills/*/SKILL.md` | `/ov-doctor`（接続・認証・WAL 診断）、`/ov-ingest`（ドキュメント・リポジトリ・スキルの取り込み手順）、`/ov-experience`（テレメトリを維持したトラブルシューティング知見検索）、`/ov-rule-search`（変更前のコンパイル済みアーキテクチャルール検索）。 |
 | **常駐ルール（Rules）** | `rules/openviking-context.md` | フロントマターで `trigger: always_on` を明示。`viking://` 仮想 URI の境界、`viking://~` ホームエイリアス指定、L0 -> L1 -> L2 の段階的取得、ローカルワークスペース優先の原則を常時適用します。 |
+
+agy 1.5.16 の ACP `session/load` は会話履歴を復元し、`SessionStart` の再実行はありません。次の入力で意味検索を行い、保存した位置から会話の記録を再開します。
 
 ```mermaid
 flowchart LR
@@ -57,7 +59,7 @@ flowchart LR
     HOOKS["ライフサイクルフック\n(session-start / pre-invocation / pre-tool / stop)"]
     MCP["ov-agy mcp-proxy\n(stdio <-> Streamable HTTP)"]
     WORKER["バックグラウンド ov-agy worker"]
-    WAL[("オフライン WAL\nwal/pending.jsonl")]
+    WAL[("オフライン WAL\nwal/{scope}/pending.jsonl")]
     OV["OpenViking サーバー\n(/health, /api/v1/*, /mcp)"]
 
     AGY -->|"stdin/stdout JSON"| HOOKS
@@ -89,7 +91,7 @@ agy plugin install https://github.com/JamCh01/agy-openviking
 社内プロキシ環境や GitHub Releases へのアクセスが制限されている環境では、環境変数 `OPENVIKING_RELEASE_BASE_URL` にミラー先のベース URL（アーカイブと `checksums.txt` の配置先）を指定できます。
 
 ```bash
-export OPENVIKING_RELEASE_BASE_URL="https://mirror.example.com/JamCh01/agy-openviking/releases/download/v0.1.1"
+export OPENVIKING_RELEASE_BASE_URL="https://mirror.example.com/JamCh01/agy-openviking/releases/download/v0.1.2"
 ```
 
 ### ソースコードからのローカルビルド（開発向け）
@@ -150,6 +152,8 @@ agy plugin install .
 5. **OpenViking サーバー設定ファイル**：`~/.openviking/ov.conf`（または `OPENVIKING_CONFIG_FILE`、`server.*` / `antigravity.*` を含む）
 6. **組み込みデフォルト値**：`http://127.0.0.1:1933`（設定ファイルが存在せず `OPENVIKING_MEMORY_ENABLED` も未指定の場合、プラグインは自動的に無効化されオーバーヘッドは発生しません）。
 
+ワークスペースの設定ファイルでは peer とプラグインの動作を指定できます。サーバー URL、API キー、アカウント、ユーザーは個人の設定か環境変数で指定します。オフラインキューはこれらの接続情報と peer ごとに分離されます。旧形式の `wal/pending.jsonl` は手動復旧用に保持されます。
+
 ### 環境変数リファレンス
 
 | 環境変数 | デフォルト値 | 説明 |
@@ -165,11 +169,14 @@ agy plugin install .
 | `OPENVIKING_HOME` | `~/.openviking` | OpenViking の設定・ログ用ベースディレクトリ。 |
 | `OPENVIKING_CLI_CONFIG_FILE` | `~/.openviking/ovcli.conf` | `ovcli.conf` 設定ファイルのパス上書き。 |
 | `OPENVIKING_CONFIG_FILE` | `~/.openviking/ov.conf` | `ov.conf` 設定ファイルのパス上書き。 |
-| `OPENVIKING_PLUGIN_DATA` / `OPENVIKING_STATE_DIR` | `~/.openviking/agy-plugin` | ターン状態・ロック・オフライン `wal/pending.jsonl`・キャッシュ済みバイナリの保存先。 |
+| `OPENVIKING_PLUGIN_DATA` / `OPENVIKING_STATE_DIR` | `~/.openviking/agy-plugin` | ターン状態・ロック・オフライン `wal/<scope>/pending.jsonl`・キャッシュ済みバイナリの保存先。 |
 | `OPENVIKING_TIMEOUT_MS` | `15000` | HTTP リクエストタイムアウト（ミリ秒、`500`–`300000`）。 |
 | `OPENVIKING_AUTO_RECALL` | `true` | `PreInvocation` での自動コンテキスト検索を有効化。 |
 | `OPENVIKING_AUTO_CAPTURE` | `true` | `Stop` でのバックグラウンド会話キャプチャと自動コミットを有効化。 |
-| `OPENVIKING_RECALL_LIMIT` | `6` | 1 ターンあたりに取得する最大コンテキスト件数（`1`–`50`）。 |
+| `OPENVIKING_RECALL_LIMIT` | サーバー設定 | 明示した値（1–50）を開発用の 6 分類に配分し、各分類に最低 1 枠を割り当てます。旧 find の既定値は 6 件です。 |
+| `OPENVIKING_RECALL_MAX_TOKENS` | サーバー設定 | コンテキスト検索のトークン予算（64–32000）。 |
+| `OPENVIKING_RECALL_REWRITE` | 無効 | フックの制限時間内でサーバーの書き換えを使う場合は `server` または `auto`。 |
+| `OPENVIKING_NO_AUTO_INJECT` | `false` | 起動時のプロフィール、索引、スキル一覧を省略します。アーカイブ概要とターンごとの検索は引き続き使えます。 |
 | `OPENVIKING_RECALL_DEDUP_TURNS` | `5` | サーバー側のターン間重複排除ウィンドウ（`0`–`20`）。 |
 | `OPENVIKING_SCORE_THRESHOLD` | `0.35` | 検索ヒットの最小スコア閾値（`0.0`–`1.0`）。 |
 | `OPENVIKING_MIN_QUERY_LENGTH` | `3` | コンテキスト検索を発火させる最小プロンプト文字数（`1`–`64`）。 |
@@ -178,7 +185,7 @@ agy plugin install .
 | `OPENVIKING_RECALL_QUERY_FILTERS` | *(空)* | 検索前にクエリ文字列へ適用する `sed` 形式（`s/pat/rep/g`、`d/pat/`、`k/pat/`）または正規表現フィルタ。 |
 | `OPENVIKING_CAPTURE_FILTERS` | *(空)* | キャプチャ前に適用するマスク・除外フィルタ（`user:` / `assistant:` プレフィックス対応）。 |
 | `OPENVIKING_CAPTURE_MAX_LENGTH` | `24000` | キャプチャする 1 メッセージあたりの最大文字数（`200`–`100000`）。 |
-| `OPENVIKING_COMMIT_EVERY_TURNS` | `6` | `POST /api/v1/sessions/{id}/commit` を実行する未コミットターン数の閾値（`1`–`1000`）。 |
+| `OPENVIKING_COMMIT_EVERY_TURNS` | `6` | バッチ内のコミット間隔（1–1000）。アイドル時には残りのメッセージもコミットします。 |
 | `OPENVIKING_DEBUG` | `false` | 有効時、`OPENVIKING_DEBUG_LOG` へ JSONL 診断ログを追記（`stdout` には一切出力しません）。 |
 | `OPENVIKING_DEBUG_LOG` | `~/.openviking/logs/agy.jsonl` | デバッグ有効時の JSONL ログファイル出力先。 |
 | `OPENVIKING_RELEASE_BASE_URL` | GitHub Releases URL | `scripts/fetch-binary.sh` が事前ビルド済みバイナリを取得する際のカスタム URL プレフィックス。 |

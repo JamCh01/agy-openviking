@@ -67,10 +67,12 @@ This document locks the verified public HTTP REST, MCP Streamable HTTP, configur
   }
   ```
 
-### 2.2 Skill Discovery (`SessionStart`)
+### 2.2 Profiles, session archive and skill discovery (`SessionStart`)
 - Queries private home-alias skills `viking://~/skills` and shared account skills `viking://agent/skills` (never uid-less `viking://user/skills`):
-  - `GET /api/v1/fs/ls?uri=viking%3A%2F%2F~%2Fskills&include_abstract=true&limit=50`
-  - `GET /api/v1/fs/ls?uri=viking%3A%2F%2Fagent%2Fskills&include_abstract=true&limit=50`
+  - `GET /api/v1/fs/ls?uri=viking%3A%2F%2F~%2Fskills&include_abstract=true&limit=30`
+  - `GET /api/v1/fs/ls?uri=viking%3A%2F%2Fagent%2Fskills&include_abstract=true&limit=30`
+- Reads `profile.md` with `GET /api/v1/content/read` and recursively lists `preferences/` and `entities/` under `viking://~/memories` and the active `viking://~/peers/{peer}/memories`.
+- Requests `latest_archive_overview` from `GET /api/v1/sessions/{session_id}/context?token_budget=1000`. Missing data is skipped.
 - Entry fields: `name`, `uri`, `isDir`, `abstract` (optional), `access` (optional).
 
 ### 2.3 Context-Aware Recall (`POST /api/v1/search/search`)
@@ -81,13 +83,14 @@ This document locks the verified public HTTP REST, MCP Streamable HTTP, configur
     "mode": "context",
     "session_id": "agy-<conversationId>",
     "dedup_turns": 5,
-    "limit": 6,
+    "purpose": "coding",
     "score_threshold": 0.35
   }
   ```
+  - Explicit recall limits set six weighted source quotas with one slot per source. The server applies its coding preset when quotas are omitted. Optional `max_tokens` (64–32000) and `rewrite` (true or "auto") control assembly.
   - Optional `"peer_scope": "actor"` when `recallPeerScope == "actor"`.
   - Optional `"exclude_uris": [...]` when configured (up to 200 entries).
-  - Note: `mode: "context"` does **not** accept `target_uri` (server returns `400 INVALID_ARGUMENT`). If an older OpenViking server rejects `mode: "context"` (`400`/`422` unknown field), `ov-agy` falls back to `POST /api/v1/search/find` over `viking://~/memories` and `viking://~/skills`.
+  - Note: `mode: "context"` does **not** accept `target_uri` (server returns `400 INVALID_ARGUMENT`). If an older OpenViking server rejects `mode: "context"` (`400`/`422` unknown field), `ov-agy` falls back to `POST /api/v1/search/find` over `viking://~/memories` and `viking://~/skills` if neither actor-only scope nor URI exclusions are configured.
 - **Response (`mode: "context"`)**:
   ```json
   {
@@ -116,6 +119,7 @@ This document locks the verified public HTTP REST, MCP Streamable HTTP, configur
   - Content selection priority: if `stats.rewrite == "no_relevant"`, emit nothing; otherwise `digest` (if non-empty) -> `rendered` (if non-empty) -> formatted `entries` (or `memories`/`resources`/`skills` list items).
 
 ### 2.4 Session Capture & Commit
+- The worker reads completed messages from the full transcript when available, holds its cursor before an in-progress turn, and commits outstanding messages on idle Stop. Offline operations replay from `wal/<scope>/pending.jsonl` for the same URL, account, user, key and peer. The legacy `wal/pending.jsonl` is retained for manual recovery.
 - **Session ID Convention**: `agy-{conversationId}`
 - **Append Message (`POST /api/v1/sessions/{session_id}/messages`)**:
   ```json
@@ -145,6 +149,7 @@ This document locks the verified public HTTP REST, MCP Streamable HTTP, configur
 
 ## 3. MCP Streamable HTTP Endpoint (`/mcp`)
 
+- The proxy requests `roots/list` from clients advertising roots and refreshes the first local workspace after `notifications/roots/list_changed`. Installed plugins fall back to personal configuration when the host provides no local root.
 - **Transport**: Stdio newline-delimited JSON-RPC 2.0 <-> `POST {base_url}/mcp`.
 - **Headers**:
   - `Content-Type: application/json`
@@ -170,7 +175,7 @@ This document locks the verified public HTTP REST, MCP Streamable HTTP, configur
    - File existence: enabled if `ovcli.conf` or `ov.conf` exists; silently disabled otherwise.
 2. **Credential & Connection Priority** (honoring `OPENVIKING_CREDENTIAL_SOURCE=cli|env|auto`):
    - `OPENVIKING_URL` / `OPENVIKING_BASE_URL`, `OPENVIKING_API_KEY` / `OPENVIKING_BEARER_TOKEN`, `OPENVIKING_ACCOUNT`, `OPENVIKING_USER`, `OPENVIKING_PEER_ID`
-   - Workspace `.openviking/config.local.json` -> `.openviking/config.json` (`version: 1`, `peer.id`, `peer.source`, `recall.*`, `capture.*`)
+   - Workspace `.openviking/config.local.json` and `.openviking/config.json` can override the peer and behavior settings. URL, keys and tenant identity come from the personal configuration or environment.
    - `OPENVIKING_CLI_CONFIG_FILE` or `~/.openviking/ovcli.conf` (`url`, `api_key`, `account`, `user`, `actor_peer_id`, `plugin`, `plugin.antigravity`)
    - `OPENVIKING_CONFIG_FILE` or `~/.openviking/ov.conf` (`server.url` or `server.host` + `server.port`, `server.root_api_key`, `antigravity`)
    - Default URL: `http://127.0.0.1:1933`.
@@ -196,13 +201,14 @@ All `agy` hook payloads use `camelCase` JSON on `stdin` and expect a single JSON
 ```
 
 ### 5.1 `SessionStart` & `PreInvocation`
-- **`PreInvocation` additional `stdin` fields**: `invocationNum` (1-based integer), `initialNumSteps` (integer).
+- agy 1.5.16 restores history on ACP `session/load`. The next prompt sends `PreInvocation` without another `SessionStart`. It can recall newly stored memories. The startup archive injection runs when the host emits `SessionStart`.
+- **`PreInvocation` additional `stdin` fields**: `invocationNum` (zero-based integer, recall only on 0), `initialNumSteps` (integer).
 - **`stdout` (Context Injected)**:
   ```json
   {
     "injectSteps": [
       {
-        "ephemeralMessage": "<openviking-context>\n...\n</openviking-context>"
+        "systemMessage": { "systemMessage": "<openviking-context>\n...\n</openviking-context>" }
       }
     ]
   }
@@ -226,7 +232,7 @@ All `agy` hook payloads use `camelCase` JSON on `stdin` and expect a single JSON
   ```
   *(Flat aliases `toolName` and `toolInput` are also accepted for test/harness compatibility.)*
 - **`stdout`**:
-  - Any string argument containing `"viking://"`:
+  - A file path argument beginning with `viking://` (case-insensitive):
     ```json
     {
       "decision": "deny",

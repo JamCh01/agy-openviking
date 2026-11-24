@@ -57,26 +57,37 @@ fn is_read_only_local_tool(tool_name: &str) -> bool {
     )
 }
 
-/// Recursively inspects all string values inside `value` for `"viking://"`.
-#[must_use]
-pub fn contains_viking_uri(value: &Value) -> bool {
-    match value {
-        Value::String(s) => contains_ascii_case_insensitive(s, "viking://"),
-        Value::Array(arr) => arr.iter().any(contains_viking_uri),
-        Value::Object(map) => map.values().any(contains_viking_uri),
-        Value::Null | Value::Bool(_) | Value::Number(_) => false,
-    }
-}
-
-fn contains_ascii_case_insensitive(haystack: &str, needle_lower: &str) -> bool {
-    let n_bytes = needle_lower.as_bytes();
-    let h_bytes = haystack.as_bytes();
-    if n_bytes.is_empty() || h_bytes.len() < n_bytes.len() {
-        return false;
-    }
-    h_bytes
-        .windows(n_bytes.len())
-        .any(|win| win.eq_ignore_ascii_case(n_bytes))
+/// Only location fields address a filesystem object. Text and search patterns may quote a URI.
+fn contains_viking_uri(args: &Value) -> bool {
+    args.as_object().is_some_and(|map| {
+        map.iter().any(|(key, value)| {
+            let field = key.to_ascii_lowercase();
+            if ![
+                "path",
+                "file",
+                "directory",
+                "folder",
+                "paths",
+                "directories",
+            ]
+            .iter()
+            .any(|suffix| field.ends_with(suffix))
+            {
+                return false;
+            }
+            let is_uri = |v: &Value| {
+                v.as_str().is_some_and(|s| {
+                    s.trim_start()
+                        .get(.."viking://".len())
+                        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("viking://"))
+                })
+            };
+            match value {
+                Value::Array(values) => values.iter().any(is_uri),
+                other => is_uri(other),
+            }
+        })
+    })
 }
 
 #[cfg(test)]
@@ -128,6 +139,23 @@ mod tests {
             cli_edit_deny,
             PreToolOutput::deny(VIKING_DENY_REASON),
             "CLI edit_file targeting viking:// must be denied"
+        );
+
+        assert_eq!(
+            run_sync(
+                r#"{"toolName":"write_file","toolInput":{"Path":"/tmp/out.md","Content":"viking://~/skills"}}"#
+            ),
+            PreToolOutput::ask()
+        );
+        assert_eq!(
+            run_sync(
+                r#"{"toolName":"grep_search","toolInput":{"SearchPath":"/tmp","Query":"viking://resources"}}"#
+            ),
+            PreToolOutput::allow()
+        );
+        assert_eq!(
+            run_sync(r#"{"toolName":"read_file","toolInput":{"Path":"VIKING://~/skills"}}"#),
+            PreToolOutput::deny(VIKING_DENY_REASON)
         );
 
         let cli_write_ask = run_sync(

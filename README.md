@@ -34,22 +34,24 @@
 `agy-openviking` (`ov-agy`) integrates OpenViking into all five customization pillars of Google Antigravity CLI (`agy`)—**MCP Server, Lifecycle Hooks, Subagent, Skills, and Rules**—as a single native Rust binary with **zero Node.js or Python runtime dependencies**:
 
 - **Sub-Millisecond Fast Path & Fail-Open Safety**: Hot-path hooks (`PreToolUse` and `Stop`) execute synchronously in `< 1 ms` without initializing an async runtime. Every hook catches network timeouts and configuration errors, emitting safe fallback JSON with exit code `0` so `agy` never stalls when OpenViking is offline.
-- **Prompt-Cache-Safe Turn Deduplication**: `PreInvocation` seeks only the trailing `64 KiB` of `transcript.jsonl` and hashes `(conversationId, turn_offset, query)`, executing `mode: "context"` recall once per user turn while emitting `{}` with zero network I/O on inner tool-call iterations (`invocationNum > 1`).
+- **Turn deduplication.** The first model call uses the current user input and transcript step. Tool iterations (`invocationNum > 0`) and wakeups after a model response skip recall.
 - **Git Worktree Peer Normalization**: Resolves linked `.git` worktree pointers (`gitdir:` + `commondir`) back to the shared `.git/config`, normalizing SSH (`git@github.com:Org/Repo.git`) and HTTPS (`https://github.com/Org/Repo.git`) remotes into an identical repository `peer` identifier.
-- **Anti-Poisoning Capture & Offline WAL**: Strips injected `<openviking-context>`, `<openviking-session>`, and `<available-skills>` blocks before archiving conversation turns in a detached background worker, buffering unsent payloads in an `fs4`-locked JSONL Write-Ahead Log (`wal/pending.jsonl`, up to `10 MiB`) during server outages.
+- **Anti-Poisoning Capture & Offline WAL**: Strips injected `<openviking-context>`, `<openviking-session>`, and `<available-skills>` blocks before archiving conversation turns in a detached background worker, buffering unsent payloads in an `fs4`-locked JSONL Write-Ahead Log (`wal/<scope>/pending.jsonl`, up to `10 MiB`) during server outages.
 
 ## Architecture and Components
 
 | Component | Entrypoint / File | Responsibility |
 | :--- | :--- | :--- |
-| **MCP Proxy** | `ov-agy mcp-proxy` (`mcp_config.json`) | Bridges stdio JSON-RPC 2.0 to Streamable HTTP `POST {base_url}/mcp` across both `application/json` and `text/event-stream` (SSE), transparently re-initializing expired `mcp-session-id` sessions on HTTP `404`. |
-| **`SessionStart` Hook** | `./scripts/ov-agy hook session-start` | Probes `/health` and `/api/v1/system/status`, discovers remote skills under `viking://~/skills` and `viking://agent/skills`, and injects session status once at startup. |
-| **`PreInvocation` Hook** | `./scripts/ov-agy hook pre-invocation` | Extracts the active user turn from the tail of `transcript.jsonl`, deduplicates inner tool-loop calls, and injects `<openviking-context>` via `POST /api/v1/search/search` (`mode: "context"`). |
-| **`PreToolUse` Hook** | `./scripts/ov-agy hook pre-tool` | Synchronous `< 1 ms` guard preventing `viking://` virtual URIs from leaking into local filesystem tools (`view_file`, `write_to_file`, `replace_file_content`, `multi_replace_file_content`, `list_dir`, `grep_search`). |
-| **`Stop` Hook & Worker** | `./scripts/ov-agy hook stop` -> `ov-agy worker` | Spawns `ov-agy worker` detached (`Stdio::null()`) when `fullyIdle == true`; sanitizes injected XML tags, appends turns to `agy-{conversationId}`, triggers periodic `/commit`, and replays `wal/pending.jsonl`. |
+| **MCP Proxy** | `ov-agy mcp-proxy` (`mcp_config.json`) | Negotiates the workspace with agy using MCP `roots/list` and forwards JSON/SSE requests to `{base_url}/mcp`. An expired stateful session is reinitialized on HTTP 404. |
+| **`SessionStart` Hook** | `./scripts/ov-agy hook session-start` | Checks connectivity and injects the user and project profiles, preference and entity indexes, skill catalog, and latest session archive when available. |
+| **`PreInvocation` Hook** | `./scripts/ov-agy hook pre-invocation` | Uses `lastUserInput` and the transcript (preferring `transcript_full.jsonl`) to identify the user turn for coding-context recall. |
+| **`PreToolUse` Hook** | `./scripts/ov-agy hook pre-tool` | Blocks local file operations whose path starts with `viking://`. A URI quoted in the file body or search pattern is allowed. |
+| **`Stop` Hook & Worker** | `./scripts/ov-agy hook stop` -> `ov-agy worker` | On idle Stop, sends finished messages to `agy-{conversationId}`, commits the remaining batch, and replays the matching offline queue. |
 | **Subagent** | `agents/viking-navigator.md` | Read-only background subagent (`inheritMcp: true`, `commandExecutionPolicy: off`) performing progressive L0 -> L1 -> L2 exploration of `viking://` trees without bloating the main context window. |
 | **Skills (`/ov-*`)** | `skills/*/SKILL.md` | `/ov-doctor` (connectivity & WAL diagnostics), `/ov-ingest` (resource/skill ingestion SOP), `/ov-experience` (telemetry-preserving troubleshooting recall), and `/ov-rule-search` (compiled architectural compliance search). |
 | **Always-On Rule** | `rules/openviking-context.md` | Enforces `viking://` virtual URI boundaries, `viking://~` home-alias addressing, L0 -> L1 -> L2 progressive retrieval, and live workspace provenance priority (`trigger: always_on`). |
+
+With agy 1.5.16, ACP `session/load` restores conversation history without a second `SessionStart`. The next prompt runs semantic recall and capture continues from the saved cursor.
 
 ```mermaid
 flowchart LR
@@ -57,7 +59,7 @@ flowchart LR
     HOOKS["Lifecycle Hooks\n(session-start / pre-invocation / pre-tool / stop)"]
     MCP["ov-agy mcp-proxy\n(stdio <-> Streamable HTTP)"]
     WORKER["Detached ov-agy worker"]
-    WAL[("Offline WAL\nwal/pending.jsonl")]
+    WAL[("Offline WAL\nwal/{scope}/pending.jsonl")]
     OV["OpenViking Server\n(/health, /api/v1/*, /mcp)"]
 
     AGY -->|"stdin/stdout JSON"| HOOKS
@@ -89,7 +91,7 @@ On the first invocation when no local Cargo build is present, `./scripts/ov-agy`
 In Mainland China, corporate intranets, or air-gapped environments, set `OPENVIKING_RELEASE_BASE_URL` to mirror or proxy the GitHub Release asset prefix (hosting `ov-agy-v<version>-<target>.tar.gz` / `.zip` and `checksums.txt`):
 
 ```bash
-export OPENVIKING_RELEASE_BASE_URL="https://mirror.example.com/JamCh01/agy-openviking/releases/download/v0.1.1"
+export OPENVIKING_RELEASE_BASE_URL="https://mirror.example.com/JamCh01/agy-openviking/releases/download/v0.1.2"
 ```
 
 ### Build from Source (Local Development)
@@ -150,6 +152,8 @@ When `OPENVIKING_CREDENTIAL_SOURCE=auto` (default), `ov-agy` resolves settings f
 5. **OpenViking Server Config**: `~/.openviking/ov.conf` (or `OPENVIKING_CONFIG_FILE`, including `server.*` and `antigravity.*`)
 6. **Built-in Defaults**: `http://127.0.0.1:1933` (if neither config files nor `OPENVIKING_MEMORY_ENABLED` exist, the plugin remains silently disabled with zero overhead).
 
+Workspace files configure the peer and plugin behavior. Set the server URL, API key, account and user in your personal configuration or environment. Offline queues are scoped to those connection details and the peer. The legacy `wal/pending.jsonl` is retained for manual recovery.
+
 ### Environment Variables Reference
 
 | Variable | Default | Description |
@@ -165,11 +169,14 @@ When `OPENVIKING_CREDENTIAL_SOURCE=auto` (default), `ov-agy` resolves settings f
 | `OPENVIKING_HOME` | `~/.openviking` | Base directory for OpenViking configuration and logs. |
 | `OPENVIKING_CLI_CONFIG_FILE` | `~/.openviking/ovcli.conf` | Path override for the OpenViking CLI JSON config file. |
 | `OPENVIKING_CONFIG_FILE` | `~/.openviking/ov.conf` | Path override for the OpenViking server JSON config file. |
-| `OPENVIKING_PLUGIN_DATA` / `OPENVIKING_STATE_DIR` | `~/.openviking/agy-plugin` | Persistent directory for turn state, locks, `wal/pending.jsonl`, and cached binaries. |
+| `OPENVIKING_PLUGIN_DATA` / `OPENVIKING_STATE_DIR` | `~/.openviking/agy-plugin` | Persistent directory for turn state, locks, `wal/<scope>/pending.jsonl`, and cached binaries. |
 | `OPENVIKING_TIMEOUT_MS` | `15000` | HTTP request timeout in milliseconds (`500`–`300000`). |
 | `OPENVIKING_AUTO_RECALL` | `true` | Enables automatic turn-level context recall in `PreInvocation`. |
 | `OPENVIKING_AUTO_CAPTURE` | `true` | Enables detached conversation turn capture and commit on `Stop`. |
-| `OPENVIKING_RECALL_LIMIT` | `6` | Maximum context items recalled per user turn (`1`–`50`). |
+| `OPENVIKING_RECALL_LIMIT` | Server preset | Distributes explicit values (1–50) across six coding sources with at least one slot each. Legacy find defaults to 6. |
+| `OPENVIKING_RECALL_MAX_TOKENS` | Server default | Token budget for context recall (64–32000). |
+| `OPENVIKING_RECALL_REWRITE` | Off | Request server rewriting with `server` or `auto` within the hook timeout. |
+| `OPENVIKING_NO_AUTO_INJECT` | `false` | Skip startup profiles, indexes, and skills. The session archive and per-turn recall remain available. |
 | `OPENVIKING_RECALL_DEDUP_TURNS` | `5` | Server-side cross-turn deduplication window (`0`–`20`). |
 | `OPENVIKING_SCORE_THRESHOLD` | `0.35` | Minimum relevance score threshold for recalled entries (`0.0`–`1.0`). |
 | `OPENVIKING_MIN_QUERY_LENGTH` | `3` | Minimum user prompt character count required to trigger recall (`1`–`64`). |
@@ -178,7 +185,7 @@ When `OPENVIKING_CREDENTIAL_SOURCE=auto` (default), `ov-agy` resolves settings f
 | `OPENVIKING_RECALL_QUERY_FILTERS` | *(empty)* | `sed`-style (`s/pat/rep/g`, `d/pat/`, `k/pat/`) or regex drop rules applied before recall. |
 | `OPENVIKING_CAPTURE_FILTERS` | *(empty)* | `sed`-style or regex redaction/drop rules (supports `user:` / `assistant:` prefixes) before capture. |
 | `OPENVIKING_CAPTURE_MAX_LENGTH` | `24000` | Per-message character cap for session capture (`200`–`100000`). |
-| `OPENVIKING_COMMIT_EVERY_TURNS` | `6` | Uncommitted turn threshold before triggering `POST /api/v1/sessions/{id}/commit` (`1`–`1000`). |
+| `OPENVIKING_COMMIT_EVERY_TURNS` | `6` | Commit interval within a capture batch (1–1000). Idle Stop also commits the remaining messages. |
 | `OPENVIKING_DEBUG` | `false` | Appends structured diagnostic events to `OPENVIKING_DEBUG_LOG` (never `stdout`). |
 | `OPENVIKING_DEBUG_LOG` | `~/.openviking/logs/agy.jsonl` | File path for JSONL diagnostic logs when `OPENVIKING_DEBUG=true`. |
 | `OPENVIKING_RELEASE_BASE_URL` | GitHub Releases URL | Custom base URL prefix used by `scripts/fetch-binary.sh` for prebuilt binary downloads. |

@@ -34,22 +34,24 @@
 `agy-openviking`（`ov-agy`）以**零 Node.js / Python 运行时依赖**的 Rust 单一编译二进制，将 OpenViking 完整桥接至 Google Antigravity CLI（`agy`）的五大扩展支柱（**MCP 服务 + 生命周期钩子 + 异步子 Agent + 技能包 + 常驻规则**）：
 
 - **亚毫秒级同步热路径与降级放行（Fail-Open）**：高频生命周期钩子（`PreToolUse` 与 `Stop`）走零异步运行时开销的同步热路径（`< 1 ms`）；所有钩子统一捕获网络超时与配置异常并以退出码 `0` 返回合法兜底 JSON，确保 OpenViking 离线时绝不阻塞 `agy` 主流程。
-- **Prompt Cache 友好的轮次去重保护**：`PreInvocation` 仅尾部定位读取 `transcript.jsonl` 末尾 `64 KiB`，对 `(conversationId, turn_offset, query)` 计算摘要，确保每个用户提问轮次仅触发一次 `mode: "context"` 检索；同一轮工具调用内循环（`invocationNum > 1`）直接零网络开销返回 `{}`，避免破坏大模型前缀缓存。
+- **按用户轮次去重。** 首次模型调用根据当前提问和对话步骤召回。工具循环（`invocationNum > 0`）及模型回复后的后台唤醒跳过召回。
 - **Git Worktree 仓库级 Peer 归一化**：自动解析链式 Git 工作树（`.git` 文件中的 `gitdir:` 与 `commondir`）回溯共享 `.git/config`，将 SSH（`git@github.com:Org/Repo.git`）与 HTTPS（`https://github.com/Org/Repo.git`）远端地址归一化为同一仓库级 `peer` 标识。
-- **防记忆自污染采集与离线预写日志（WAL）**：后台独立进程 `ov-agy worker` 在归档对话前自动剥离 `<openviking-context>`、`<openviking-session>` 与 `<available-skills>` 注入块；服务端不可达时通过 `fs4` 文件锁将待写消息持久化至 `wal/pending.jsonl`（上限 `10 MiB`），待服务恢复后自动重放。
+- **防记忆自污染采集与离线预写日志（WAL）**：后台独立进程 `ov-agy worker` 在归档对话前自动剥离 `<openviking-context>`、`<openviking-session>` 与 `<available-skills>` 注入块；服务端不可达时通过 `fs4` 文件锁将待写消息持久化至 `wal/<scope>/pending.jsonl`（上限 `10 MiB`），待服务恢复后自动重放。
 
 ## 核心架构与组件
 
 | 组件 | 入口 / 文件路径 | 职责边界 |
 | :--- | :--- | :--- |
-| **MCP 代理（`mcp-proxy`）** | `ov-agy mcp-proxy`（`mcp_config.json`） | 将标准输入输出 JSON-RPC 2.0 桥接至 Streamable HTTP `POST {base_url}/mcp`，同时兼容 `application/json` 与 `text/event-stream`（SSE）流式响应，并在遇到 HTTP `404` 会话过期时透明重握手恢复 `mcp-session-id`。 |
-| **`SessionStart` 生命周期钩子** | `./scripts/ov-agy hook session-start` | 会话启动时探测 `/health` 与 `/api/v1/system/status`，拉取 `viking://~/skills` 与 `viking://agent/skills` 远端技能摘要，一次性注入会话状态上下文。 |
-| **`PreInvocation` 生命周期钩子** | `./scripts/ov-agy hook pre-invocation` | 从 `transcript.jsonl` 尾部提取最新用户指令，按用户轮次去重后调用 `POST /api/v1/search/search`（`mode: "context"`）注入 `<openviking-context>`。 |
-| **`PreToolUse` 生命周期钩子** | `./scripts/ov-agy hook pre-tool` | `< 1 ms` 同步安全守卫，拦截任何误将 `viking://` 虚拟 URI 传入本地文件工具（`view_file`、`write_to_file`、`replace_file_content`、`multi_replace_file_content`、`list_dir`、`grep_search`）的调用。 |
-| **`Stop` 钩子与后台 `worker`** | `./scripts/ov-agy hook stop` -> `ov-agy worker` | 当 `fullyIdle == true` 时以分离模式（`Stdio::null()`）派生后台 `ov-agy worker`；清洗注入标签后写入 `agy-{conversationId}` 会话、按轮次阈值触发 `/commit`，并在故障时读写离线 `wal/pending.jsonl`。 |
+| **MCP 代理（`mcp-proxy`）** | `ov-agy mcp-proxy`（`mcp_config.json`） | 通过 MCP `roots/list` 获取 agy 工作区，向 `{base_url}/mcp` 转发 JSON/SSE 请求。有状态会话过期返回 HTTP 404 时重新握手。 |
+| **`SessionStart` 生命周期钩子** | `./scripts/ov-agy hook session-start` | 检查连接，注入用户和项目画像、偏好与实体索引、技能清单，以及当前会话已有的归档摘要。 |
+| **`PreInvocation` 生命周期钩子** | `./scripts/ov-agy hook pre-invocation` | 通过 `lastUserInput` 和对话日志识别提问轮次，优先读取 `transcript_full.jsonl`，按编程场景召回。 |
+| **`PreToolUse` 生命周期钩子** | `./scripts/ov-agy hook pre-tool` | 拦截路径以 `viking://` 开头的本地文件操作。文件正文和搜索关键词可以引用该 URI。 |
+| **`Stop` 钩子与后台 `worker`** | `./scripts/ov-agy hook stop` -> `ov-agy worker` | 空闲时将已完成的消息写入 `agy-{conversationId}`，提交剩余批次，并重放当前身份的离线队列。 |
 | **异步子 Agent** | `agents/viking-navigator.md` | 只读后台检索子 Agent（`inheritMcp: true`，`commandExecutionPolicy: off`），按 L0 -> L1 -> L2 分层探索 `viking://` 知识树并返回带精确 URI 引用的精炼结论，保持主对话上下文精简。 |
 | **四大技能（`/ov-*`）** | `skills/*/SKILL.md` | `/ov-doctor`（连通性与离线队列自检）、`/ov-ingest`（外部文档/仓库与技能入库流程）、`/ov-experience`（保留遥测归因的排障经验召回）、`/ov-rule-search`（代码修改前编译态架构规范检索）。 |
 | **常驻规则（Rules）** | `rules/openviking-context.md` | 顶部显式声明 `trigger: always_on`，约束模型遵守 `viking://` 虚拟路径边界、`viking://~` 主目录别名寻址、L0 -> L1 -> L2 渐进检索及本地工作区事实优先原则。 |
+
+在 agy 1.5.16 中，ACP 的 `session/load` 会恢复历史，但不会再次触发 `SessionStart`。下一次提问仍会执行语义召回，采集从上次保存的位置继续。
 
 ```mermaid
 flowchart LR
@@ -57,7 +59,7 @@ flowchart LR
     HOOKS["生命周期钩子\n(session-start / pre-invocation / pre-tool / stop)"]
     MCP["ov-agy mcp-proxy\n(stdio <-> Streamable HTTP)"]
     WORKER["独立后台进程 ov-agy worker"]
-    WAL[("离线预写日志 WAL\nwal/pending.jsonl")]
+    WAL[("离线预写日志 WAL\nwal/{scope}/pending.jsonl")]
     OV["OpenViking 服务端\n(/health, /api/v1/*, /mcp)"]
 
     AGY -->|"stdin/stdout JSON"| HOOKS
@@ -89,7 +91,7 @@ agy plugin install https://github.com/JamCh01/agy-openviking
 若处于中国大陆网络环境、企业内网或受限网络，可通过环境变量 `OPENVIKING_RELEASE_BASE_URL` 指定镜像站或内网制品库前缀（目录内放置对应版本的压缩包与 `checksums.txt`）：
 
 ```bash
-export OPENVIKING_RELEASE_BASE_URL="https://mirror.example.com/JamCh01/agy-openviking/releases/download/v0.1.1"
+export OPENVIKING_RELEASE_BASE_URL="https://mirror.example.com/JamCh01/agy-openviking/releases/download/v0.1.2"
 ```
 
 ### 从源码本地构建开发
@@ -150,6 +152,8 @@ agy plugin install .
 5. **OpenViking 服务端配置文件**：`~/.openviking/ov.conf`（或 `OPENVIKING_CONFIG_FILE`，支持 `server.*` 与 `antigravity.*`）
 6. **内置默认值**：`http://127.0.0.1:1933`（若未检测到任何配置文件且未显式设置 `OPENVIKING_MEMORY_ENABLED`，插件自动保持静默关闭，零额外开销）。
 
+工作区文件可设置 peer 和插件行为。服务地址、API 密钥、账号和用户由个人配置或环境变量提供。离线队列按这些连接信息及 peer 隔离，旧版 `wal/pending.jsonl` 保留供手工恢复。
+
 ### 环境变量完整列表
 
 | 环境变量 | 默认值 | 说明 |
@@ -165,11 +169,14 @@ agy plugin install .
 | `OPENVIKING_HOME` | `~/.openviking` | OpenViking 基础配置与日志根目录。 |
 | `OPENVIKING_CLI_CONFIG_FILE` | `~/.openviking/ovcli.conf` | 自定义 `ovcli.conf` 文件路径。 |
 | `OPENVIKING_CONFIG_FILE` | `~/.openviking/ov.conf` | 自定义 `ov.conf` 文件路径。 |
-| `OPENVIKING_PLUGIN_DATA` / `OPENVIKING_STATE_DIR` | `~/.openviking/agy-plugin` | 会话状态、文件锁、离线 `wal/pending.jsonl` 与预编译二进制缓存目录。 |
+| `OPENVIKING_PLUGIN_DATA` / `OPENVIKING_STATE_DIR` | `~/.openviking/agy-plugin` | 会话状态、文件锁、离线 `wal/<scope>/pending.jsonl` 与预编译二进制缓存目录。 |
 | `OPENVIKING_TIMEOUT_MS` | `15000` | HTTP 请求超时时间，单位毫秒（范围 `500`–`300000`）。 |
 | `OPENVIKING_AUTO_RECALL` | `true` | 是否在 `PreInvocation` 阶段启用自动上下文记忆召回。 |
 | `OPENVIKING_AUTO_CAPTURE` | `true` | 是否在 `Stop` 阶段启用后台对话采集与自动提交。 |
-| `OPENVIKING_RECALL_LIMIT` | `6` | 单轮召回的最大上下文条目数（范围 `1`–`50`）。 |
+| `OPENVIKING_RECALL_LIMIT` | 服务端预设 | 显式设置后按权重分配给六类来源，每类至少一项（取值 1–50）。旧版 find 默认取 6 项。 |
+| `OPENVIKING_RECALL_MAX_TOKENS` | 服务端默认 | 上下文召回的 token 预算（64–32000）。 |
+| `OPENVIKING_RECALL_REWRITE` | 关闭 | 设为 `server` 或 `auto` 启用服务端改写，受钩子超时限制。 |
+| `OPENVIKING_NO_AUTO_INJECT` | `false` | 跳过启动画像、索引和技能清单。归档摘要和逐轮召回仍可用。 |
 | `OPENVIKING_RECALL_DEDUP_TURNS` | `5` | 服务端跨轮次去重窗口大小（范围 `0`–`20`）。 |
 | `OPENVIKING_SCORE_THRESHOLD` | `0.35` | 召回结果最低相关性分数阈值（范围 `0.0`–`1.0`）。 |
 | `OPENVIKING_MIN_QUERY_LENGTH` | `3` | 触发记忆召回的最短用户提问字符数（范围 `1`–`64`）。 |
@@ -178,7 +185,7 @@ agy plugin install .
 | `OPENVIKING_RECALL_QUERY_FILTERS` | *(空)* | 召回前应用于查询文本的 `sed` 风格（`s/pat/rep/g`、`d/pat/`、`k/pat/`）或正则过滤规则。 |
 | `OPENVIKING_CAPTURE_FILTERS` | *(空)* | 采集前脱敏或丢弃规则（支持 `user:` / `assistant:` 角色前缀）。 |
 | `OPENVIKING_CAPTURE_MAX_LENGTH` | `24000` | 单条采集消息最大字符数上限（范围 `200`–`100000`）。 |
-| `OPENVIKING_COMMIT_EVERY_TURNS` | `6` | 触发 `POST /api/v1/sessions/{id}/commit` 的未提交轮次阈值（范围 `1`–`1000`）。 |
+| `OPENVIKING_COMMIT_EVERY_TURNS` | `6` | 单次采集中的分批提交间隔（1–1000）。空闲结束时也提交剩余消息。 |
 | `OPENVIKING_DEBUG` | `false` | 开启后向 `OPENVIKING_DEBUG_LOG` 追加 JSONL 诊断日志（绝不写入 `stdout`）。 |
 | `OPENVIKING_DEBUG_LOG` | `~/.openviking/logs/agy.jsonl` | 开启调试模式时的 JSONL 诊断日志路径。 |
 | `OPENVIKING_RELEASE_BASE_URL` | GitHub Releases 地址 | `scripts/fetch-binary.sh` 拉取预编译二进制包时的自定义下载前缀。 |

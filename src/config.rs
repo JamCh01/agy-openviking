@@ -55,6 +55,10 @@ pub struct ResolvedConfig {
     pub auto_recall: bool,
     pub auto_capture: bool,
     pub recall_limit: usize,
+    pub explicit_recall_limit: Option<usize>,
+    pub recall_max_tokens: Option<usize>,
+    pub recall_rewrite: Option<Value>,
+    pub inject_startup_memories: bool,
     pub recall_dedup_turns: u32,
     pub score_threshold: f64,
     pub min_query_length: usize,
@@ -168,6 +172,25 @@ impl ResolvedConfig {
             obj
         });
 
+        for (name, workspace) in [("config.json", &ws_team), ("config.local.json", &ws_local)] {
+            if let Some(map) = workspace {
+                for key in [
+                    "url",
+                    "baseUrl",
+                    "api_key",
+                    "apiKey",
+                    "account",
+                    "accountId",
+                    "user",
+                    "userId",
+                ] {
+                    if map.contains_key(key) {
+                        warnings.push(format!("Ignoring {key} in workspace {name}; configure connections in ovcli.conf or the environment."));
+                    }
+                }
+            }
+        }
+
         let plugin_shared = cli_json
             .as_ref()
             .and_then(|m| m.get("plugin"))
@@ -232,26 +255,6 @@ impl ResolvedConfig {
             },
             if allow_file_creds {
                 (
-                    ws_local.as_ref().and_then(|m| {
-                        json_str(m.get("url")).or_else(|| json_str(m.get("baseUrl")))
-                    }),
-                    "workspace:config.local.json",
-                )
-            } else {
-                (None, "")
-            },
-            if allow_file_creds {
-                (
-                    ws_team.as_ref().and_then(|m| {
-                        json_str(m.get("url")).or_else(|| json_str(m.get("baseUrl")))
-                    }),
-                    "workspace:config.json",
-                )
-            } else {
-                (None, "")
-            },
-            if allow_file_creds {
-                (
                     cli_json.as_ref().and_then(|m| json_str(m.get("url"))),
                     "ovcli.conf",
                 )
@@ -291,26 +294,6 @@ impl ResolvedConfig {
                     env_non_empty(env, "OPENVIKING_API_KEY")
                         .or_else(|| env_non_empty(env, "OPENVIKING_BEARER_TOKEN")),
                     "env",
-                )
-            } else {
-                (None, "")
-            },
-            if allow_file_creds {
-                (
-                    ws_local.as_ref().and_then(|m| {
-                        json_str(m.get("api_key")).or_else(|| json_str(m.get("apiKey")))
-                    }),
-                    "workspace:config.local.json",
-                )
-            } else {
-                (None, "")
-            },
-            if allow_file_creds {
-                (
-                    ws_team.as_ref().and_then(|m| {
-                        json_str(m.get("api_key")).or_else(|| json_str(m.get("apiKey")))
-                    }),
-                    "workspace:config.json",
                 )
             } else {
                 (None, "")
@@ -370,20 +353,6 @@ impl ResolvedConfig {
                 None
             },
             if allow_file_creds {
-                ws_local.as_ref().and_then(|m| {
-                    json_str(m.get("account")).or_else(|| json_str(m.get("accountId")))
-                })
-            } else {
-                None
-            },
-            if allow_file_creds {
-                ws_team.as_ref().and_then(|m| {
-                    json_str(m.get("account")).or_else(|| json_str(m.get("accountId")))
-                })
-            } else {
-                None
-            },
-            if allow_file_creds {
                 plugin_agy
                     .and_then(|m| json_str(m.get("accountId")))
                     .or_else(|| plugin_shared.and_then(|m| json_str(m.get("accountId"))))
@@ -406,20 +375,6 @@ impl ResolvedConfig {
         let user = first_non_empty_val(&[
             if allow_env_creds {
                 env_non_empty(env, "OPENVIKING_USER")
-            } else {
-                None
-            },
-            if allow_file_creds {
-                ws_local
-                    .as_ref()
-                    .and_then(|m| json_str(m.get("user")).or_else(|| json_str(m.get("userId"))))
-            } else {
-                None
-            },
-            if allow_file_creds {
-                ws_team
-                    .as_ref()
-                    .and_then(|m| json_str(m.get("user")).or_else(|| json_str(m.get("userId"))))
             } else {
                 None
             },
@@ -536,7 +491,7 @@ impl ResolvedConfig {
             .or_else(|| layer_bool(&layers, &["autoCapture", "syncTurns"]))
             .unwrap_or(true);
 
-        let recall_limit = env_usize(env, "OPENVIKING_RECALL_LIMIT")
+        let explicit_recall_limit = env_usize(env, "OPENVIKING_RECALL_LIMIT")
             .or_else(|| {
                 ws_nested_usize(
                     ws_local.as_ref(),
@@ -545,8 +500,22 @@ impl ResolvedConfig {
                 )
             })
             .or_else(|| layer_usize(&layers, &["recallLimit"]))
-            .unwrap_or(DEFAULT_RECALL_LIMIT)
-            .clamp(1, 50);
+            .map(|v| v.clamp(1, 50));
+        let recall_limit = explicit_recall_limit.unwrap_or(DEFAULT_RECALL_LIMIT);
+
+        let recall_max_tokens = env_usize(env, "OPENVIKING_RECALL_MAX_TOKENS")
+            .or_else(|| layer_usize(&layers, &["recallMaxTokens"]))
+            .map(|v| v.clamp(64, 32_000));
+        let recall_rewrite = env_non_empty(env, "OPENVIKING_RECALL_REWRITE")
+            .or_else(|| layer_str(&layers, &["recallRewrite"]))
+            .and_then(|v| match v.as_str() {
+                "server" => Some(Value::Bool(true)),
+                "auto" => Some(Value::String(v)),
+                _ => None,
+            });
+        let inject_startup_memories = !env_bool(env, "OPENVIKING_NO_AUTO_INJECT")
+            .or_else(|| layer_bool(&layers, &["noAutoInject"]))
+            .unwrap_or(false);
 
         let recall_dedup_turns = env_usize(env, "OPENVIKING_RECALL_DEDUP_TURNS")
             .or_else(|| {
@@ -632,6 +601,10 @@ impl ResolvedConfig {
             auto_recall,
             auto_capture,
             recall_limit,
+            explicit_recall_limit,
+            recall_max_tokens,
+            recall_rewrite,
+            inject_startup_memories,
             recall_dedup_turns,
             score_threshold,
             min_query_length,
@@ -1549,6 +1522,40 @@ mod tests {
             cfg.root_key_warning.is_some(),
             "matching server.root_api_key must trigger root_key_warning"
         );
+    }
+
+    #[test]
+    fn workspace_settings_do_not_retarget_personal_credentials() {
+        let temp = TempDir::new().unwrap();
+        let repo = temp.path().join("repo");
+        let ws = repo.join(".openviking");
+        let personal = temp.path().join(".openviking");
+        fs::create_dir_all(&ws).unwrap();
+        fs::create_dir_all(&personal).unwrap();
+        fs::write(personal.join("ovcli.conf"),r#"{"url":"http://localhost:1933","api_key":"personal","account":"acct","user":"alice"}"#).unwrap();
+        for name in ["config.json", "config.local.json"] {
+            fs::write(ws.join(name), r#"{"url":"http://wrong.test","apiKey":"wrong-key","account":"other","userId":"other","peer":{"id":"project"}}"#).unwrap();
+        }
+        let env = HashMap::from([("HOME".to_owned(), temp.path().display().to_string())]);
+        let cfg = ResolvedConfig::load_with_env(Some(&repo), &env);
+        assert_eq!(
+            (
+                &*cfg.base_url,
+                &*cfg.api_key,
+                &*cfg.account,
+                &*cfg.user,
+                &*cfg.peer_id
+            ),
+            (
+                "http://localhost:1933",
+                "personal",
+                "acct",
+                "alice",
+                "project"
+            )
+        );
+        assert!(cfg.warnings.iter().any(|w| w.contains("config.local.json")));
+        assert!(cfg.warnings.iter().all(|w| !w.contains("wrong-key")));
     }
 
     #[test]

@@ -8,7 +8,7 @@ use sha2::Sha256;
 
 use crate::client::OvClient;
 use crate::config::{self, ResolvedConfig};
-use crate::hooks::transcript::{self, LatestUserTurn};
+use crate::hooks::transcript;
 use crate::wire::{InjectOutput, LastRecallSnapshot, PreInvocationInput};
 
 const PRE_INVOCATION_BUDGET: Duration = Duration::from_millis(4200);
@@ -47,56 +47,63 @@ async fn run_inner(raw_stdin: &str) -> InjectOutput {
         .filter(|s| !s.is_empty())
         .unwrap_or("default");
 
-    let latest_turn = parsed
-        .common
-        .transcript_path
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .and_then(|tp| transcript::extract_latest_user_turn_tail(Path::new(tp)))
-        .or_else(|| {
-            let fallback = parsed.common.last_user_input.as_deref()?;
-            let cleaned = transcript::strip_injected_blocks(fallback);
-            if cleaned.is_empty() {
-                None
-            } else {
-                Some(LatestUserTurn {
-                    byte_offset: 0,
-                    text: cleaned,
-                })
-            }
-        });
-
-    let Some(turn) = latest_turn else {
-        cfg.log_debug("hook.pre_invocation", "no_user_turn", json!({}));
+    if parsed.invocation_num.unwrap_or(0) != 0 {
+        return InjectOutput::empty();
+    }
+    let lock_path = cfg.lock_file_path(&format!("recall-{conversation_id}"));
+    let Ok(Some(_guard)) = config::try_acquire_exclusive_lock(&lock_path) else {
         return InjectOutput::empty();
     };
-
-    let turn_hash = compute_turn_dedup_hash(conversation_id, turn.byte_offset, &turn.text);
-    let query_hash = compute_turn_dedup_hash(conversation_id, 0, &turn.text);
-
-    // Turn-level deduplication: skip network I/O on inner tool-loop steps (`invocationNum` > 1).
+    let recorded = parsed.common.transcript_path.as_deref().and_then(|path| {
+        transcript::extract_latest_user_turn_tail(
+            &transcript::preferred_transcript(Path::new(path)),
+            parsed.initial_num_steps,
+        )
+    });
+    let host_query = parsed
+        .common
+        .last_user_input
+        .as_deref()
+        .map(transcript::strip_injected_blocks)
+        .filter(|s| !s.is_empty());
+    let (query, turn_id) = match (host_query, recorded) {
+        (Some(query), Some(ref step))
+            if step.truncated || query.split_whitespace().eq(step.text.split_whitespace()) =>
+        {
+            if step.answered {
+                return InjectOutput::empty();
+            }
+            (
+                query,
+                step.step_index
+                    .map_or(step.byte_offset, |i| i.saturating_add(1)),
+            )
+        }
+        (Some(query), _) => (query, parsed.initial_num_steps.unwrap_or(0)),
+        (None, Some(step)) if !step.answered => (
+            step.text,
+            step.step_index
+                .map_or(step.byte_offset, |i| i.saturating_add(1)),
+        ),
+        _ => return InjectOutput::empty(),
+    };
+    let turn_hash = compute_turn_dedup_hash(conversation_id, turn_id, &query);
     let existing_state = config::load_conversation_state(&cfg, conversation_id);
-    let fallback_inner_loop_match = turn.byte_offset == 0
-        && parsed.invocation_num.unwrap_or(1) > 1
-        && existing_state.last_recall_query_hash.as_deref() == Some(query_hash.as_str());
-    if existing_state.last_recall_hash.as_deref() == Some(turn_hash.as_str())
-        || fallback_inner_loop_match
-    {
+    if existing_state.last_recall_hash.as_deref() == Some(turn_hash.as_str()) {
         cfg.log_debug(
             "hook.pre_invocation",
             "dedup_skip",
             json!({
                 "conversation_id": conversation_id,
                 "invocation_num": parsed.invocation_num,
-                "byte_offset": turn.byte_offset,
+                "turn": turn_id,
             }),
         );
         return InjectOutput::empty();
     }
 
     let compiled_filters = config::compile_input_filters(&cfg.recall_query_filters);
-    let filtered = config::apply_input_filters(&turn.text, &compiled_filters, "user");
+    let filtered = config::apply_input_filters(&query, &compiled_filters, "user");
     if filtered.dropped || filtered.text.chars().count() < cfg.min_query_length {
         let _ = config::update_conversation_state_with_budget(
             &cfg,
@@ -104,7 +111,6 @@ async fn run_inner(raw_stdin: &str) -> InjectOutput {
             STATE_LOCK_BUDGET,
             |state| {
                 state.last_recall_hash = Some(turn_hash.clone());
-                state.last_recall_query_hash = Some(query_hash.clone());
                 state.last_recall_at_ms = Some(config::now_epoch_ms());
                 if !cfg.peer_id.is_empty() {
                     state.peer_id = Some(cfg.peer_id.clone());
@@ -148,7 +154,6 @@ async fn run_inner(raw_stdin: &str) -> InjectOutput {
         STATE_LOCK_BUDGET,
         |state| {
             state.last_recall_hash = Some(turn_hash);
-            state.last_recall_query_hash = Some(query_hash);
             state.last_recall_at_ms = Some(now_ms);
             if !cfg.peer_id.is_empty() {
                 state.peer_id = Some(cfg.peer_id.clone());
@@ -180,27 +185,27 @@ async fn run_inner(raw_stdin: &str) -> InjectOutput {
                 "injected_context",
                 json!({ "chars": block.len(), "invocation_num": parsed.invocation_num }),
             );
-            InjectOutput::new_ephemeral(block)
+            InjectOutput::new_system(block)
         }
         None => InjectOutput::empty(),
     }
 }
 
-/// Computes the deterministic SHA-256 fingerprint of `(conversation_id, byte_offset, text)`.
+/// Computes the fingerprint of the conversation, user step (or byte offset) and text.
 #[must_use]
-pub fn compute_turn_dedup_hash(conversation_id: &str, byte_offset: u64, text: &str) -> String {
+pub fn compute_turn_dedup_hash(conversation_id: &str, turn_id: u64, text: &str) -> String {
     use sha2::Digest;
 
     let mut hasher = Sha256::new();
     hasher.update(conversation_id.as_bytes());
     hasher.update(b":");
-    hasher.update(byte_offset.to_string().as_bytes());
+    hasher.update(turn_id.to_string().as_bytes());
     hasher.update(b":");
     hasher.update(text.as_bytes());
     hex::encode(hasher.finalize())
 }
 
-fn wrap_openviking_context(raw_body: &str) -> String {
+pub(super) fn wrap_openviking_context(raw_body: &str) -> String {
     let safe_body = raw_body
         .replace("<openviking-context", "[openviking-context")
         .replace("</openviking-context>", "[/openviking-context]");

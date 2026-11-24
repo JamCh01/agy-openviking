@@ -75,18 +75,25 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
     let Some(ref transcript_path) = args.transcript_path else {
         return Ok(());
     };
-    if !transcript_path.is_file() {
-        return Ok(());
-    }
-
-    // 2. Read transcript incremental delta starting from saved `last_byte_offset`.
     let initial_state = config::load_conversation_state(&cfg, &args.conversation_id);
-    let delta =
-        transcript::read_new_turns_from_offset(transcript_path, initial_state.last_byte_offset)?;
-
-    if delta.new_byte_offset == initial_state.last_byte_offset && delta.turns.is_empty() {
+    let selected = transcript::preferred_transcript(transcript_path);
+    let full = selected
+        .file_name()
+        .is_some_and(|name| name == "transcript_full.jsonl");
+    let previous_full = initial_state.transcript_full.unwrap_or_else(|| {
+        transcript_path
+            .file_name()
+            .is_some_and(|name| name == "transcript_full.jsonl")
+    });
+    if !selected.is_file() || (previous_full && !full) {
         return Ok(());
     }
+    let mut offset = initial_state.last_byte_offset;
+    if full && !previous_full && offset > 0 {
+        let short = selected.with_file_name("transcript.jsonl");
+        offset = transcript::translate_cursor(&short, &selected, offset)?;
+    }
+    let delta = transcript::read_new_turns_from_offset(&selected, offset)?;
 
     // 3. Anti-poisoning sanitization + `captureFilters`.
     let capture_filters = config::compile_input_filters(&cfg.capture_filters);
@@ -112,10 +119,16 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
         }
     }
 
-    if payloads.is_empty() {
-        let _ = config::update_conversation_state(&cfg, &args.conversation_id, |state| {
+    if payloads.is_empty() && initial_state.uncommitted_turns == 0 {
+        if delta.new_byte_offset == initial_state.last_byte_offset
+            && Some(full) == initial_state.transcript_full
+        {
+            return Ok(());
+        }
+        config::update_conversation_state(&cfg, &args.conversation_id, |state| {
             state.last_byte_offset = delta.new_byte_offset;
-        });
+            state.transcript_full = Some(full);
+        })?;
         return Ok(());
     }
 
@@ -126,62 +139,57 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
     let mut send_failed_to_offline = wal_still_blocked;
 
     for payload in &payloads {
+        if !send_failed_to_offline {
+            match client.add_session_message(&ov_session_id, payload).await {
+                Ok(()) => sent_count += 1,
+                Err(err) if err.should_queue_to_wal() => {
+                    send_failed_to_offline = true;
+                    cfg.log_debug(
+                        "worker",
+                        "queueing_to_wal",
+                        json!({ "error": err.to_string() }),
+                    );
+                }
+                Err(err) => {
+                    cfg.log_debug(
+                        "worker",
+                        "message_non_retryable_error",
+                        json!({ "error": err.to_string() }),
+                    );
+                    continue;
+                }
+            }
+        }
         if send_failed_to_offline {
             wal_batch.push(WalEntry::add_message(&ov_session_id, payload));
-            uncommitted += 1;
-            if uncommitted >= cfg.commit_every_turns {
-                wal_batch.push(WalEntry::commit(&ov_session_id));
-                uncommitted = 0;
-            }
-            continue;
         }
+        uncommitted += 1;
+        if uncommitted >= cfg.commit_every_turns
+            && commit_or_queue(
+                &client,
+                &cfg,
+                &ov_session_id,
+                &mut send_failed_to_offline,
+                &mut wal_batch,
+            )
+            .await
+        {
+            uncommitted = 0;
+        }
+    }
 
-        match client.add_session_message(&ov_session_id, payload).await {
-            Ok(()) => {
-                sent_count += 1;
-                uncommitted += 1;
-                if uncommitted >= cfg.commit_every_turns {
-                    match client.commit_session(&ov_session_id).await {
-                        Ok(()) => {
-                            uncommitted = 0;
-                        }
-                        Err(err) if err.should_queue_to_wal() => {
-                            send_failed_to_offline = true;
-                            wal_batch.push(WalEntry::commit(&ov_session_id));
-                            uncommitted = 0;
-                        }
-                        Err(err) => {
-                            cfg.log_debug(
-                                "worker",
-                                "commit_non_retryable_error",
-                                json!({ "error": err.to_string() }),
-                            );
-                        }
-                    }
-                }
-            }
-            Err(err) if err.should_queue_to_wal() => {
-                cfg.log_debug(
-                    "worker",
-                    "queueing_to_wal",
-                    json!({ "error": err.to_string(), "session_id": ov_session_id }),
-                );
-                send_failed_to_offline = true;
-                wal_batch.push(WalEntry::add_message(&ov_session_id, payload));
-                uncommitted += 1;
-                if uncommitted >= cfg.commit_every_turns {
-                    wal_batch.push(WalEntry::commit(&ov_session_id));
-                    uncommitted = 0;
-                }
-            }
-            Err(err) => {
-                cfg.log_debug(
-                    "worker",
-                    "message_non_retryable_error",
-                    json!({ "error": err.to_string() }),
-                );
-            }
-        }
+    // An idle Stop can be the final event of a short conversation.
+    if uncommitted > 0
+        && commit_or_queue(
+            &client,
+            &cfg,
+            &ov_session_id,
+            &mut send_failed_to_offline,
+            &mut wal_batch,
+        )
+        .await
+    {
+        uncommitted = 0;
     }
 
     // 4. Sync unsent turns to WAL BEFORE advancing `last_byte_offset`.
@@ -196,6 +204,7 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
 
     config::update_conversation_state(&cfg, &args.conversation_id, |state| {
         state.last_byte_offset = delta.new_byte_offset;
+        state.transcript_full = Some(full);
         state.uncommitted_turns = uncommitted;
         state.total_captured_turns += sent_count + queued_msgs;
         if let Some(ref peer) = peer_opt {
@@ -216,4 +225,29 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
     );
 
     Ok(())
+}
+
+async fn commit_or_queue(
+    client: &OvClient,
+    cfg: &ResolvedConfig,
+    session: &str,
+    offline: &mut bool,
+    batch: &mut Vec<WalEntry>,
+) -> bool {
+    if !*offline {
+        match client.commit_session(session).await {
+            Ok(()) => return true,
+            Err(err) if err.should_queue_to_wal() => *offline = true,
+            Err(err) => {
+                cfg.log_debug(
+                    "worker",
+                    "commit_non_retryable_error",
+                    json!({ "error": err.to_string() }),
+                );
+                return false;
+            }
+        }
+    }
+    batch.push(WalEntry::commit(session));
+    true
 }

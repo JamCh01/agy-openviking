@@ -82,6 +82,12 @@ async fn spawn_mock_ov_server(state: Arc<MockServerState>) -> SpawnedServer {
         .route("/health", get(handle_health))
         .route("/api/v1/system/status", get(handle_system_status))
         .route("/api/v1/fs/ls", get(handle_fs_ls))
+        .route("/api/v1/content/read", get(|Query(params): Query<HashMap<String,String>>| async move {
+            Json(json!({"status":"ok", "result":format!("Profile for {}",params["uri"])}))
+        }))
+        .route("/api/v1/sessions/{session_id}/context", get(|AxumPath(id): AxumPath<String>| async move {
+            Json(json!({"status":"ok", "result":{"latest_archive_overview":format!("archive of {id}")}}))
+        }))
         .route("/api/v1/search/search", post(handle_search))
         .route("/api/v1/sessions", post(handle_create_session))
         .route(
@@ -186,6 +192,10 @@ async fn handle_fs_ls(
                 "isDir": true,
                 "abstract": "Audit Rust crates for unsafe blocks and musl compatibility."
             }
+        ]),
+        "viking://~/memories/entities" => json!([
+            {"rel_path":"repo/format.md","abstract":"Rust style fixture", "isDir": false},
+            {"rel_path":"repo/hidden.md","abstract":"denied fixture", "access":"denied"}
         ]),
         "viking://agent/skills" => json!([
             {
@@ -495,6 +505,17 @@ fn run_hook_cmd(args: &[&str], stdin_json: &str, envs: &[(&str, &str)]) -> Comma
     }
 }
 
+fn active_wal_path(plugin_data: &Path) -> PathBuf {
+    let paths: Vec<_> = fs::read_dir(plugin_data.join("wal"))
+        .expect("WAL directory")
+        .flatten()
+        .map(|entry| entry.path().join("pending.jsonl"))
+        .filter(|p| p.is_file())
+        .collect();
+    assert_eq!(paths.len(), 1, "expected a single active WAL");
+    paths[0].clone()
+}
+
 fn setup_test_ovcli(dir: &Path, base_url: &str, api_key: &str) -> TestConfigPaths {
     let ov_home = dir.join("ov-home");
     let plugin_data = dir.join("plugin-data");
@@ -633,12 +654,12 @@ async fn test_2_pre_invocation_loop_dedup() {
         ),
     ];
 
-    // Invocation 1: hits `/api/v1/search/search` once and returns `ephemeralMessage`.
+    // The initial (zero-based) invocation hits `/api/v1/search/search` once and returns `systemMessage.systemMessage`.
     let stdin_inv_1 = json!({
         "conversationId": "conv-loop-42",
         "workspacePaths": [temp_dir.path().display().to_string()],
         "transcriptPath": transcript_path.display().to_string(),
-        "invocationNum": 1
+        "invocationNum": 0
     })
     .to_string();
 
@@ -672,15 +693,15 @@ async fn test_2_pre_invocation_loop_dedup() {
         !out_inv_1.stdout.contains("\"metadata\""),
         "PreInvocation output must NEVER include `metadata` (proto_utils.go panic hazard)"
     );
-    let ephemeral_msg = json_1["injectSteps"][0]["ephemeralMessage"]
+    let system_message = json_1["injectSteps"][0]["systemMessage"]["systemMessage"]
         .as_str()
-        .expect("injectSteps[0].ephemeralMessage must be present");
+        .expect("injectSteps[0].systemMessage.systemMessage must be present");
     assert!(
-        ephemeral_msg.contains("<openviking-context>"),
+        system_message.contains("<openviking-context>"),
         "injected message must wrap recalled content in <openviking-context>"
     );
     assert!(
-        ephemeral_msg
+        system_message
             .contains("Recalled note for: How should we structure rustls HTTP client timeouts?"),
         "injected message must carry recalled server body"
     );
@@ -696,7 +717,8 @@ async fn test_2_pre_invocation_loop_dedup() {
         search_req["dedup_turns"], 5,
         "dedup_turns must default to 5"
     );
-    assert_eq!(search_req["limit"], 6, "recall limit must default to 6");
+    assert_eq!(search_req["purpose"], "coding");
+    assert!(search_req.get("quotas").is_none());
     assert_eq!(
         search_req["session_id"], "agy-conv-loop-42",
         "session_id must follow agy-<conversationId>"
@@ -717,7 +739,7 @@ async fn test_2_pre_invocation_loop_dedup() {
         "X-API-Key header must match configured key"
     );
 
-    // Append model tool-call step (same user turn) and invoke `invocationNum: 2`.
+    // Append model tool-call step (same user turn) and invoke `invocationNum: 1`.
     let mut append_file = OpenOptions::new()
         .append(true)
         .open(&transcript_path)
@@ -733,7 +755,7 @@ async fn test_2_pre_invocation_loop_dedup() {
         "conversationId": "conv-loop-42",
         "workspacePaths": [temp_dir.path().display().to_string()],
         "transcriptPath": transcript_path.display().to_string(),
-        "invocationNum": 2
+        "invocationNum": 1
     })
     .to_string();
 
@@ -754,7 +776,7 @@ async fn test_2_pre_invocation_loop_dedup() {
     assert_eq!(
         mock_state.search_hits.load(Ordering::SeqCst),
         1,
-        "invocationNum 2 within same user turn must make ZERO network requests"
+        "invocationNum 1 within same user turn must make ZERO network requests"
     );
     assert_eq!(
         out_inv_2.stdout.trim(),
@@ -778,7 +800,7 @@ async fn test_2_pre_invocation_loop_dedup() {
         "conversationId": "conv-loop-42",
         "workspacePaths": [temp_dir.path().display().to_string()],
         "transcriptPath": transcript_path.display().to_string(),
-        "invocationNum": 3
+        "invocationNum": 0
     })
     .to_string();
 
@@ -801,9 +823,9 @@ async fn test_2_pre_invocation_loop_dedup() {
     let json_3: Value = serde_json::from_str(out_inv_3.stdout.trim())
         .expect("invocation 3 stdout must be valid JSON");
     assert!(
-        json_3["injectSteps"][0]["ephemeralMessage"]
+        json_3["injectSteps"][0]["systemMessage"]["systemMessage"]
             .as_str()
-            .expect("invocation 3 ephemeralMessage must be string")
+            .expect("invocation 3 systemMessage.systemMessage must be string")
             .contains("Now check SSE reconnection semantics"),
         "invocation 3 must inject recalled context for the new prompt"
     );
@@ -926,9 +948,9 @@ async fn test_3_git_worktree_peer_normalization() {
     assert_eq!(ss_out.exit_code, 0, "session-start must exit 0");
     let ss_json: Value =
         serde_json::from_str(ss_out.stdout.trim()).expect("session-start stdout must be JSON");
-    let ss_msg = ss_json["injectSteps"][0]["ephemeralMessage"]
+    let ss_msg = ss_json["injectSteps"][0]["systemMessage"]["systemMessage"]
         .as_str()
-        .expect("session-start must emit ephemeralMessage");
+        .expect("session-start must emit systemMessage.systemMessage");
     assert!(
         ss_msg.contains("<openviking-session>"),
         "session-start must include <openviking-session>"
@@ -1032,7 +1054,7 @@ async fn test_4_worker_sanitization_and_offline_wal() {
         "no messages should be recorded on server while returning 503"
     );
 
-    let wal_path = paths.plugin_data.join("wal").join("pending.jsonl");
+    let wal_path = active_wal_path(&paths.plugin_data);
     assert!(wal_path.is_file(), "WAL file must be created on HTTP 503");
     let wal_raw = fs::read_to_string(&wal_path).expect("WAL file should be readable");
     assert!(
@@ -2134,10 +2156,10 @@ async fn test_9_review_regressions_hooks_mcp_and_auth_wal() {
     .expect("first worker task must join");
     assert!(status_first.success(), "worker on 403 must exit 0");
 
-    let wal_file = cap_paths.plugin_data.join("wal").join("pending.jsonl");
+    let wal_file = active_wal_path(&cap_paths.plugin_data);
     assert!(
         wal_file.is_file(),
-        "HTTP 403 during capture must preserve turn in wal/pending.jsonl"
+        "HTTP 403 during capture must preserve turn in its scoped WAL"
     );
 
     #[cfg(unix)]
@@ -2148,10 +2170,32 @@ async fn test_9_review_regressions_hooks_mcp_and_auth_wal() {
             .permissions()
             .mode()
             & 0o777;
-        assert_eq!(wal_mode, 0o600, "wal/pending.jsonl must have 0600 mode");
+        assert_eq!(wal_mode, 0o600, "the pending WAL must have 0600 mode");
     }
 
     reject_403.store(false, Ordering::SeqCst);
+    let original = fs::read_to_string(&cap_paths.cli_conf).unwrap();
+    fs::write(
+        &cap_paths.cli_conf,
+        original.replace("bad-root-key", "other-tenant"),
+    )
+    .unwrap();
+    let legacy = cap_paths.plugin_data.join("wal/pending.jsonl");
+    let queued = fs::read(&wal_file).unwrap();
+    fs::write(&legacy, &queued).unwrap();
+    let other = run_worker_once(
+        auth_temp.path().to_owned(),
+        cap_paths.ov_home.clone(),
+        cap_paths.plugin_data.clone(),
+        cap_paths.cli_conf.clone(),
+        transcript_file.clone(),
+    )
+    .await
+    .unwrap();
+    assert!(other.success());
+    assert!(saved_msgs.lock().unwrap().is_empty());
+    assert_eq!(fs::read(&wal_file).unwrap(), queued);
+    fs::write(&cap_paths.cli_conf, original).unwrap();
     let status_second = run_worker_once(
         auth_temp.path().to_path_buf(),
         cap_paths.ov_home.clone(),
@@ -2167,7 +2211,7 @@ async fn test_9_review_regressions_hooks_mcp_and_auth_wal() {
     );
     assert!(
         !wal_file.exists(),
-        "wal/pending.jsonl must be drained and removed once credentials succeed"
+        "the scoped WAL must be drained and removed once credentials succeed"
     );
     assert_eq!(
         saved_msgs
@@ -2178,5 +2222,258 @@ async fn test_9_review_regressions_hooks_mcp_and_auth_wal() {
         "queued 403 turn must be replayed exactly once"
     );
 
+    assert_eq!(fs::read(legacy).unwrap(), queued);
     cap_handle.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn recall_uses_pending_user_input_once_and_skips_model_wakeups() {
+    let mock = Arc::new(MockServerState::default());
+    let server = spawn_mock_ov_server(mock.clone()).await;
+    let temp = TempDir::new().unwrap();
+    let paths = setup_test_ovcli(temp.path(), &format!("http://{}", server.addr), "key");
+    let transcript = temp.path().join("transcript.jsonl");
+    let mut steps = String::from("{\"step_index\":0,\"source\":\"USER_EXPLICIT\",\"type\":\"USER_INPUT\",\"content\":\"Previous prompt\"}\n{\"step_index\":1,\"source\":\"MODEL\",\"type\":\"PLANNER_RESPONSE\",\"content\":\"Previous reply\"}\n");
+    fs::write(&transcript, &steps).unwrap();
+    let ask = |text: &str, initial_steps, invocation| {
+        let input = json!({"conversationId":"pending","cwd":temp.path(),"transcriptPath":transcript,
+            "initialNumSteps":initial_steps,"invocationNum":invocation,"lastUserInput":text});
+        run_hook_cmd(
+            &["hook", "pre-invocation"],
+            &input.to_string(),
+            &[
+                ("HOME", temp.path().to_str().unwrap()),
+                (
+                    "OPENVIKING_CLI_CONFIG_FILE",
+                    paths.cli_conf.to_str().unwrap(),
+                ),
+                ("OPENVIKING_RECALL_LIMIT", "10"),
+                ("OPENVIKING_RECALL_MAX_TOKENS", "900"),
+                ("OPENVIKING_RECALL_REWRITE", "server"),
+            ],
+        )
+        .stdout
+    };
+    assert_eq!(ask("Previous prompt", 2, 0).trim(), "{}");
+    assert!(ask("New question", 3, 0).contains("New question"));
+    let body = mock.last_search_body.lock().unwrap().clone().unwrap();
+    assert_eq!(
+        body["quotas"],
+        json!({"events":1,"entities":2,"preferences":1,"experiences":1,"resources":3,"skills":2})
+    );
+    assert_eq!(body["max_tokens"], 900);
+    assert_eq!(body["rewrite"], true);
+    steps.push_str("{\"step_index\":2,\"source\":\"USER_EXPLICIT\",\"type\":\"USER_INPUT\",\"content\":\"New question\"}\n");
+    fs::write(&transcript, &steps).unwrap();
+    assert_eq!(ask("New question", 3, 0).trim(), "{}");
+    assert_eq!(ask("New question", 3, 1).trim(), "{}");
+    steps.push_str("{\"step_index\":3,\"source\":\"USER_EXPLICIT\",\"type\":\"USER_INPUT\",\"content\":\"New question\"}\n");
+    fs::write(&transcript, steps).unwrap();
+    assert!(ask("New question", 4, 0).contains("New question"));
+    assert_eq!(mock.search_hits.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn capture_migrates_the_cursor_and_waits_for_finished_steps() {
+    let mock = Arc::new(MockServerState::default());
+    let server = spawn_mock_ov_server(mock.clone()).await;
+    let temp = TempDir::new().unwrap();
+    let paths = setup_test_ovcli(temp.path(), &format!("http://{}", server.addr), "key");
+    let short = temp.path().join("transcript.jsonl");
+    let full = temp.path().join("transcript_full.jsonl");
+    let run = |file: &Path| {
+        let out = run_hook_cmd(
+            &[
+                "worker",
+                "--conversation-id",
+                "migration",
+                "--transcript-path",
+                file.to_str().unwrap(),
+                "--cwd",
+                temp.path().to_str().unwrap(),
+            ],
+            "",
+            &[
+                ("HOME", temp.path().to_str().unwrap()),
+                (
+                    "OPENVIKING_CLI_CONFIG_FILE",
+                    paths.cli_conf.to_str().unwrap(),
+                ),
+                (
+                    "OPENVIKING_PLUGIN_DATA",
+                    paths.plugin_data.to_str().unwrap(),
+                ),
+                ("OPENVIKING_COMMIT_EVERY_TURNS", "9"),
+            ],
+        );
+        assert_eq!(out.exit_code, 0, "{}", out.stderr);
+    };
+    let user =
+        json!({"step_index":0,"type":"USER_INPUT","source":"USER_EXPLICIT","content":"first"});
+    fs::write(&short, format!("{user}\n")).unwrap();
+    run(&short);
+    let mut complete_user = user;
+    complete_user["content"] =
+        json!("first message, originally shortened in the summary transcript");
+    let canceled = json!({"step_index":1,"type":"PLANNER_RESPONSE","status":"CANCELED","content":"canceled draft"});
+    let internal = json!({"step_index":2,"type":"USER_INPUT","source":"SYSTEM_SDK","status":"WAITING","content":"internal reminder"});
+    let mut answer =
+        json!({"step_index":3,"type":"PLANNER_RESPONSE","status":"GENERATING","content":"draft"});
+    let prefix = format!("{complete_user}\n{canceled}\n{internal}\n");
+    fs::write(&full, format!("{prefix}{answer}\n")).unwrap();
+    run(&short);
+    assert_eq!(mock.captured_messages.lock().unwrap().len(), 1);
+    // A version predating the transcript marker could already have read the full file.
+    let state_path = paths.plugin_data.join("state/migration.json");
+    let mut saved: Value = serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
+    saved.as_object_mut().unwrap().remove("transcript_full");
+    fs::write(&state_path, saved.to_string()).unwrap();
+    answer["status"] = json!("DONE");
+    answer["content"] = json!("finished answer");
+    fs::write(&full, format!("{prefix}{answer}\n")).unwrap();
+    run(&full);
+    run(&short);
+    let messages = mock.captured_messages.lock().unwrap();
+    let text: Vec<_> = messages
+        .iter()
+        .map(|msg| msg.body["parts"][0]["text"].as_str().unwrap())
+        .collect();
+    assert_eq!(text, ["first", "finished answer"]);
+    assert_eq!(mock.committed_sessions.lock().unwrap().len(), 2);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn startup_profiles_indexes_and_archive_respect_auto_inject() {
+    let state = Arc::new(MockServerState::default());
+    let server = spawn_mock_ov_server(state).await;
+    let temp = TempDir::new().unwrap();
+    let paths = setup_test_ovcli(temp.path(), &format!("http://{}", server.addr), "test-key");
+    let run = |disabled| {
+        let out = run_hook_cmd(
+            &["hook", "session-start"],
+            &json!({"conversationId":"resume","cwd":temp.path()}).to_string(),
+            &[
+                ("HOME", temp.path().to_str().unwrap()),
+                (
+                    "OPENVIKING_CLI_CONFIG_FILE",
+                    paths.cli_conf.to_str().unwrap(),
+                ),
+                ("OPENVIKING_PEER_ID", "project"),
+                ("OPENVIKING_NO_AUTO_INJECT", disabled),
+            ],
+        );
+        let body: Value = serde_json::from_str(&out.stdout).unwrap();
+        body["injectSteps"][0]["systemMessage"]["systemMessage"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    };
+    let enabled = run("0");
+    for expected in [
+        "viking://~/memories/profile.md",
+        "viking://~/peers/project/memories/profile.md",
+        "viking://~/memories/entities/repo/format.md",
+        "Rust style fixture",
+        "rust-audit",
+        "archive of agy-resume",
+    ] {
+        assert!(enabled.contains(expected), "{expected}");
+    }
+    assert!(!enabled.contains("denied fixture"));
+    let disabled = run("1");
+    assert!(disabled.contains("archive of agy-resume"));
+    for absent in ["profile.md", "Rust style fixture", "rust-audit"] {
+        assert!(!disabled.contains(absent), "{absent}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mcp_changed_roots_replace_the_stateful_upstream_session() {
+    let state = Arc::new(MockServerState::default());
+    let server = spawn_mock_ov_server(state.clone()).await;
+    let temp = TempDir::new().unwrap();
+    let paths = setup_test_ovcli(temp.path(), &format!("http://{}", server.addr), "test-key");
+    let mut child = Command::new(ov_agy_bin())
+        .arg("mcp-proxy")
+        .current_dir(temp.path())
+        .env_clear()
+        .env("HOME", temp.path())
+        .env("PLUGIN_ROOT", temp.path())
+        .env("OPENVIKING_CLI_CONFIG_FILE", paths.cli_conf)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut input = child.stdin.take().unwrap();
+    let mut output = BufReader::new(child.stdout.take().unwrap()).lines();
+    let mut send = |frame: Value| writeln!(input, "{frame}").unwrap();
+    let mut read = || serde_json::from_str::<Value>(&output.next().unwrap().unwrap()).unwrap();
+    send(
+        json!({"jsonrpc":"2.0","id":0,"method":"initialize","params":{"capabilities":{"roots":{"listChanged":true}}}}),
+    );
+    assert_eq!(read()["id"], 0);
+    send(json!({"jsonrpc":"2.0","method":"notifications/initialized"}));
+    for peer in ["one", "two"] {
+        let work = temp.path().join(format!("repo {peer}"));
+        fs::create_dir_all(work.join(".openviking")).unwrap();
+        fs::write(
+            work.join(".openviking/config.json"),
+            json!({"peer":{"id":peer}}).to_string(),
+        )
+        .unwrap();
+        send(json!({"jsonrpc":"2.0","method":"notifications/roots/list_changed"}));
+        send(json!({"jsonrpc":"2.0","id":peer,"method":"tools/call","params":{"name":"read"}}));
+        let roots = read();
+        assert_eq!(roots["method"], "roots/list");
+        let uri = url::Url::from_directory_path(&work).unwrap();
+        send(json!({"jsonrpc":"2.0","id":roots["id"],"result":{"roots":[{"uri":uri.as_str()}]}}));
+        let result = read();
+        assert_eq!(result["id"], peer);
+        assert_eq!(result["result"]["isError"], false);
+        assert_eq!(state.observed_peers.lock().unwrap().last().unwrap(), peer);
+    }
+    drop(input);
+    assert!(child.wait().unwrap().success());
+    assert_eq!(state.mcp_initialize_calls.load(Ordering::SeqCst), 3);
+    assert_eq!(state.mcp_deleted_sessions.lock().unwrap().len(), 3);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn legacy_find_respects_scope_and_recovers_partial_results() {
+    let hits = Arc::new(AtomicUsize::new(0));
+    let app = Router::new()
+        .route("/api/v1/search/search",post(||async { (StatusCode::UNPROCESSABLE_ENTITY, "unknown field mode") }))
+        .route("/api/v1/search/find",post({
+            let hits = Arc::clone(&hits);
+            move |Json(body):Json<Value>| {
+                hits.fetch_add(1,Ordering::SeqCst);
+                async move {
+                    if body["target_uri"] == "viking://~/skills" {return StatusCode::SERVICE_UNAVAILABLE.into_response();}
+                    Json(json!({"status":"ok","result":{"memories":[{"uri":"viking://user/alice/memories/note","abstract":"legacy note"}]}})).into_response()
+                }
+            }
+        }));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let temp = TempDir::new().unwrap();
+    let paths = setup_test_ovcli(
+        temp.path(),
+        &format!("http://{}", listener.local_addr().unwrap()),
+        "key",
+    );
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let recall = |scope, exclusions| {
+        run_hook_cmd(&["hook","pre-invocation"], &json!({"conversationId":scope, "cwd":temp.path(),"lastUserInput":"look up previously recorded notes"}).to_string(), &[
+        ("OPENVIKING_CLI_CONFIG_FILE",paths.cli_conf.to_str().unwrap()),("HOME",temp.path().to_str().unwrap()),
+        ("OPENVIKING_RECALL_PEER_SCOPE",scope),("OPENVIKING_RECALL_EXCLUDE_URIS",exclusions)
+    ])
+    };
+    assert_eq!(recall("actor", "").stdout.trim(), "{}");
+    assert_eq!(
+        recall("all", "viking://user/alice/memories").stdout.trim(),
+        "{}"
+    );
+    assert_eq!(hits.load(Ordering::SeqCst), 0);
+    assert!(recall("all", "").stdout.contains("legacy note"));
+    assert_eq!(hits.load(Ordering::SeqCst), 2);
+    server.abort();
 }

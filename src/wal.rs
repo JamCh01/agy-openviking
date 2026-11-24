@@ -1,4 +1,4 @@
-//! Bounded offline Write-Ahead Log (`wal/pending.jsonl`) for failed capture requests.
+//! Bounded offline Write-Ahead Log (`wal/<scope>/pending.jsonl`) for failed capture requests.
 
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Write};
@@ -7,12 +7,13 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::client::OvClient;
 use crate::config::{self, PrivateOpenMode, ResolvedConfig};
 use crate::wire::{OvAddMessageRequest, OvMessagePart};
 
-/// Maximum size (`10 MiB`) of `${STATE_DIR}/wal/pending.jsonl`.
+/// Maximum size (`10 MiB`) of `${STATE_DIR}/wal/<scope>/pending.jsonl`.
 pub const MAX_WAL_BYTES: u64 = 10 * 1024 * 1024;
 
 /// Queued session operation stored in the offline WAL.
@@ -23,7 +24,7 @@ pub enum WalOp {
     Commit,
 }
 
-/// Single JSONL record in `wal/pending.jsonl`.
+/// Single JSONL record in `wal/<scope>/pending.jsonl`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WalEntry {
     pub op: WalOp,
@@ -65,7 +66,7 @@ impl WalEntry {
     }
 }
 
-/// Current entry count and byte size of `wal/pending.jsonl`.
+/// Current entry count and byte size of `wal/<scope>/pending.jsonl`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct WalStats {
     pub entry_count: usize,
@@ -80,7 +81,7 @@ pub struct ReplayReport {
     pub dropped: usize,
 }
 
-/// File-locked offline queue manager for `wal/pending.jsonl`.
+/// File-locked offline queue manager for `wal/<scope>/pending.jsonl`.
 pub struct WalStore {
     wal_path: PathBuf,
     lock_path: PathBuf,
@@ -91,10 +92,24 @@ impl WalStore {
     /// Creates a `WalStore` rooted in `cfg.state_dir`.
     #[must_use]
     pub fn new(cfg: &ResolvedConfig) -> Self {
+        // Keys can select a different tenant even when no explicit account/user headers are set.
+        // Length prefixes keep tuple boundaries unambiguous; credentials never enter the WAL.
+        let mut digest = Sha256::new();
+        for part in [
+            &cfg.base_url,
+            &cfg.account,
+            &cfg.user,
+            &cfg.api_key,
+            &cfg.peer_id,
+        ] {
+            digest.update((part.len() as u64).to_be_bytes());
+            digest.update(part.as_bytes());
+        }
+        let scope = hex::encode(digest.finalize());
         Self {
-            wal_path: cfg.state_dir.join("wal").join("pending.jsonl"),
-            lock_path: cfg.lock_file_path("wal"),
-            replay_lock_path: cfg.lock_file_path("wal-replay"),
+            wal_path: cfg.state_dir.join("wal").join(&scope).join("pending.jsonl"),
+            lock_path: cfg.lock_file_path(&format!("wal-{scope}")),
+            replay_lock_path: cfg.lock_file_path(&format!("wal-replay-{scope}")),
         }
     }
 
@@ -127,7 +142,7 @@ impl WalStore {
         }
     }
 
-    /// Appends `entries` to `wal/pending.jsonl` under an exclusive lock, enforcing `MAX_WAL_BYTES`.
+    /// Appends `entries` to `wal/<scope>/pending.jsonl` under an exclusive lock, enforcing `MAX_WAL_BYTES`.
     pub fn append(&self, entries: &[WalEntry]) -> Result<()> {
         if entries.is_empty() {
             return Ok(());
@@ -151,7 +166,10 @@ impl WalStore {
         // Ensure at most one background worker replays the shared WAL at a time without blocking.
         let Some(_replay_guard) = config::try_acquire_exclusive_lock(&self.replay_lock_path)?
         else {
-            return Ok(ReplayReport::default());
+            return Ok(ReplayReport {
+                remaining: self.stats().entry_count.max(1),
+                ..ReplayReport::default()
+            });
         };
 
         let snapshot_lines = {

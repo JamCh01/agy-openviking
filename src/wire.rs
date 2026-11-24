@@ -43,6 +43,8 @@ pub struct PreInvocationInput {
 
     #[serde(rename = "invocationNum", default)]
     pub invocation_num: Option<u64>,
+    #[serde(rename = "initialNumSteps", default)]
+    pub initial_num_steps: Option<u64>,
 }
 
 /// Nested tool invocation descriptor inside `PreToolUse` payloads.
@@ -97,21 +99,27 @@ pub struct StopInput {
     pub fully_idle: Option<bool>,
 }
 
-/// Safe Antigravity injection step using `ephemeralMessage`.
+/// Safe Antigravity injection step using `systemMessage`.
 ///
 /// Intentionally omits `systemMessage.metadata` (which triggers a known `proto_utils.go`
 /// scrubber panic in `agy`) and `decision` (disallowed on `SessionStart`/`PreInvocation`/`Stop`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct EphemeralStep {
-    #[serde(rename = "ephemeralMessage")]
-    pub ephemeral_message: String,
+pub struct SystemStep {
+    #[serde(rename = "systemMessage")]
+    pub system_message: SystemMessage,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SystemMessage {
+    #[serde(rename = "systemMessage")]
+    pub text: String,
 }
 
 /// `stdout` response envelope for `SessionStart` and `PreInvocation` hooks.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InjectOutput {
     #[serde(rename = "injectSteps", skip_serializing_if = "Vec::is_empty")]
-    pub inject_steps: Vec<EphemeralStep>,
+    pub inject_steps: Vec<SystemStep>,
 }
 
 impl InjectOutput {
@@ -123,15 +131,15 @@ impl InjectOutput {
         }
     }
 
-    /// Constructs an injection response containing a single `ephemeralMessage` step.
+    /// Constructs an injection response containing a single `systemMessage` step.
     #[must_use]
-    pub fn new_ephemeral(content: String) -> Self {
+    pub fn new_system(content: String) -> Self {
         if content.trim().is_empty() {
             Self::empty()
         } else {
             Self {
-                inject_steps: vec![EphemeralStep {
-                    ephemeral_message: content,
+                inject_steps: vec![SystemStep {
+                    system_message: SystemMessage { text: content },
                 }],
             }
         }
@@ -235,6 +243,10 @@ pub struct OvSystemStatusResult {
 /// Directory or file entry returned by `GET /api/v1/fs/ls`.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct OvFsEntry {
+    #[serde(default, rename = "isDir")]
+    pub is_dir: bool,
+    #[serde(default)]
+    pub rel_path: Option<String>,
     #[serde(default)]
     pub name: Option<String>,
     #[serde(default)]
@@ -257,7 +269,12 @@ pub struct OvContextSearchRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub dedup_turns: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub limit: Option<usize>,
+    pub quotas: Option<Value>,
+    pub purpose: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_tokens: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rewrite: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub score_threshold: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -383,11 +400,11 @@ pub struct ConversationState {
     #[serde(default)]
     pub last_recall_hash: Option<String>,
     #[serde(default)]
-    pub last_recall_query_hash: Option<String>,
-    #[serde(default)]
     pub last_recall_at_ms: Option<u64>,
     #[serde(default)]
     pub last_byte_offset: u64,
+    #[serde(default)]
+    pub transcript_full: Option<bool>,
     #[serde(default)]
     pub uncommitted_turns: usize,
     #[serde(default)]

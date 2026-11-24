@@ -143,6 +143,9 @@ async fn run_doctor(args: DoctorArgs) {
     let wal_stats = wal.stats();
 
     let mut warnings = cfg.warnings.clone();
+    if cfg.state_dir.join("wal/pending.jsonl").is_file() {
+        warnings.push("Unscoped legacy WAL retained at wal/pending.jsonl. Verify its original destination before manual recovery.".to_owned());
+    }
     let mut root_key_warning = cfg.root_key_warning.clone();
 
     let mut health_ok = None;

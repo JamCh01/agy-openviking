@@ -39,11 +39,28 @@ async fn run_inner(raw_stdin: &str) -> InjectOutput {
         return InjectOutput::empty();
     };
 
-    let (health_res, status_res, user_skills_res, shared_skills_res) = tokio::join!(
+    let skills = async |uri| {
+        if cfg.inject_startup_memories {
+            client.list_entries(uri, false, PER_REQUEST_TIMEOUT).await
+        } else {
+            Ok(Vec::new())
+        }
+    };
+    let (health_res, status_res, user_skills_res, shared_skills_res, startup, archive) = tokio::join!(
         client.health(PER_REQUEST_TIMEOUT),
         client.system_status(PER_REQUEST_TIMEOUT),
-        client.list_skills("viking://~/skills", PER_REQUEST_TIMEOUT),
-        client.list_skills("viking://agent/skills", PER_REQUEST_TIMEOUT),
+        skills("viking://~/skills"),
+        skills("viking://agent/skills"),
+        startup_memories(&client, &cfg),
+        async {
+            let id = parsed
+                .conversation_id
+                .as_deref()
+                .filter(|s| !s.is_empty())?;
+            client
+                .latest_archive(&format!("agy-{id}"), PER_REQUEST_TIMEOUT)
+                .await
+        },
     );
 
     let mut root_key_403 = cfg.root_key_warning.clone();
@@ -67,7 +84,7 @@ async fn run_inner(raw_stdin: &str) -> InjectOutput {
             let block = format!(
                 "<openviking-session>\nstatus: warning\nwarning: {warning}\n</openviking-session>"
             );
-            return InjectOutput::new_ephemeral(block);
+            return InjectOutput::new_system(block);
         }
         cfg.log_debug("hook.session_start", "health_unreachable", json!({}));
         return InjectOutput::empty();
@@ -116,6 +133,16 @@ async fn run_inner(raw_stdin: &str) -> InjectOutput {
 
     let mut combined_sections = vec![session_lines.join("\n")];
 
+    if !startup.is_empty() {
+        combined_sections.push(super::pre_invocation::wrap_openviking_context(&startup));
+    }
+    if let Some(text) = archive.filter(|s| !s.trim().is_empty()) {
+        let overview: String = text.chars().take(2000).collect();
+        combined_sections.push(super::pre_invocation::wrap_openviking_context(&format!(
+            "Latest session archive:\n{overview}"
+        )));
+    }
+
     let skills_block = format_available_skills(
         user_skills_res.unwrap_or_default(),
         shared_skills_res.unwrap_or_default(),
@@ -130,7 +157,81 @@ async fn run_inner(raw_stdin: &str) -> InjectOutput {
         "injected",
         json!({ "chars": message.len(), "peer": cfg.peer_id }),
     );
-    InjectOutput::new_ephemeral(message)
+    InjectOutput::new_system(message)
+}
+
+async fn startup_memories(client: &OvClient, cfg: &ResolvedConfig) -> String {
+    if !cfg.inject_startup_memories {
+        return String::new();
+    }
+    let (mut lines, peer) = tokio::join!(profile_lines(client, "viking://~/memories"), async {
+        if cfg.peer_id.is_empty() {
+            Vec::new()
+        } else {
+            profile_lines(
+                client,
+                &format!("viking://~/peers/{}/memories", cfg.peer_id),
+            )
+            .await
+        }
+    });
+    lines.extend(peer);
+    lines.join("\n")
+}
+
+async fn profile_lines(client: &OvClient, root: &str) -> Vec<String> {
+    let profile_uri = format!("{root}/profile.md");
+    let prefs_uri = format!("{root}/preferences");
+    let entities_uri = format!("{root}/entities");
+    let (profile, prefs, entities) = tokio::join!(
+        client.read_profile(&profile_uri, PER_REQUEST_TIMEOUT),
+        client.list_entries(&prefs_uri, true, PER_REQUEST_TIMEOUT),
+        client.list_entries(&entities_uri, true, PER_REQUEST_TIMEOUT),
+    );
+    let mut lines = Vec::new();
+    if let Some(text) = profile.filter(|s| !s.trim().is_empty()) {
+        lines.push(format!(
+            "{profile_uri}\n{}",
+            text.chars().take(2400).collect::<String>()
+        ));
+    }
+    for (parent, entries) in [(prefs_uri, prefs), (entities_uri, entities)] {
+        lines.extend(
+            entries
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|entry| {
+                    if entry.is_dir || entry.access.as_deref() == Some("denied") {
+                        return None;
+                    }
+                    let uri = entry.uri.or_else(|| {
+                        entry
+                            .rel_path
+                            .or(entry.name)
+                            .map(|name| format!("{parent}/{name}"))
+                    })?;
+                    if uri.contains("/.")
+                        || !Path::new(&uri)
+                            .extension()
+                            .is_some_and(|ext| ext.eq_ignore_ascii_case("md"))
+                    {
+                        return None;
+                    }
+                    let mut line: String = uri.chars().take(512).collect();
+                    if let Some(summary) = entry
+                        .abstract_text
+                        .as_deref()
+                        .and_then(|s| s.lines().next())
+                    {
+                        line.push(' ');
+                        line.extend(summary.chars().take(160));
+                    }
+                    Some(line)
+                })
+                .take(6),
+        );
+    }
+    lines
 }
 
 fn format_available_skills(
