@@ -99,32 +99,77 @@ pub async fn run() -> Result<()> {
     Ok(())
 }
 
+#[derive(Debug, Clone)]
+struct ClientMessageMeta {
+    reply_mode: ReplyMode,
+    req_id: Value,
+    is_initialize: bool,
+    is_initialized_notification: bool,
+}
+
+fn inspect_client_message(msg: &Value) -> Option<ClientMessageMeta> {
+    match msg {
+        Value::Object(obj) => {
+            let reply_mode = if obj.contains_key("id") {
+                ReplyMode::ExpectReply
+            } else {
+                ReplyMode::Notification
+            };
+            let req_id = obj.get("id").cloned().unwrap_or(Value::Null);
+            let method = obj.get("method").and_then(Value::as_str).unwrap_or("");
+            Some(ClientMessageMeta {
+                reply_mode,
+                req_id,
+                is_initialize: method == "initialize",
+                is_initialized_notification: method == "notifications/initialized",
+            })
+        }
+        Value::Array(items) if !items.is_empty() && items.iter().all(Value::is_object) => {
+            let mut first_req_id = None;
+            for item in items {
+                if let Some(obj) = item.as_object() {
+                    if let Some(id_val) = obj.get("id") {
+                        first_req_id = Some(id_val.clone());
+                        break;
+                    }
+                }
+            }
+            let (reply_mode, req_id) = match first_req_id {
+                Some(id_val) => (ReplyMode::ExpectReply, id_val),
+                None => (ReplyMode::Notification, Value::Null),
+            };
+            Some(ClientMessageMeta {
+                reply_mode,
+                req_id,
+                is_initialize: false,
+                is_initialized_notification: false,
+            })
+        }
+        _ => None,
+    }
+}
+
 async fn handle_client_message<W: AsyncWrite + Unpin>(
     state: &mut ProxyState,
     msg: Value,
     stdout: &mut W,
 ) -> Result<()> {
-    let Some(obj) = msg.as_object() else {
+    let Some(meta) = inspect_client_message(&msg) else {
         let err_frame = jsonrpc_error(&Value::Null, -32600, "Invalid Request", None);
         write_json_line(stdout, &err_frame).await?;
         return Ok(());
     };
 
-    let reply_mode = if obj.contains_key("id") {
-        ReplyMode::ExpectReply
-    } else {
-        ReplyMode::Notification
-    };
-    let req_id = obj.get("id").cloned().unwrap_or(Value::Null);
-    let method = obj.get("method").and_then(Value::as_str).unwrap_or("");
+    let reply_mode = meta.reply_mode;
+    let req_id = meta.req_id;
 
-    let (session_header, req_kind) = if method == "initialize" {
+    let (session_header, req_kind) = if meta.is_initialize {
         state.cached_initialize = Some(msg.clone());
         state.session_id = None;
         state.protocol_version = DEFAULT_MCP_PROTOCOL_VERSION.to_string();
         (SessionHeader::Omit, RequestKind::Initialize)
     } else {
-        if method == "notifications/initialized" {
+        if meta.is_initialized_notification {
             state.cached_initialized_notification = Some(msg.clone());
         }
         (SessionHeader::Attach, RequestKind::Regular)
@@ -147,7 +192,7 @@ async fn handle_client_message<W: AsyncWrite + Unpin>(
                 state.cfg.log_debug(
                     "mcp_proxy",
                     "session_404_reinitializing",
-                    json!({ "method": method }),
+                    json!({ "is_batch": msg.is_array() }),
                 );
                 if reinitialize_session(state).await.is_ok() {
                     let retry_outcome = forward_once(
@@ -339,8 +384,17 @@ async fn forward_once<W: AsyncWrite + Unpin>(
         });
     }
 
-    if matches!(status.as_u16(), 202 | 204) && reply_mode == ReplyMode::Notification {
-        return Ok(UpstreamOutcome::Success);
+    if matches!(status.as_u16(), 202 | 204) {
+        if reply_mode == ReplyMode::Notification {
+            return Ok(UpstreamOutcome::Success);
+        }
+        return Ok(UpstreamOutcome::HttpError {
+            status: status.as_u16(),
+            body: format!(
+                "Upstream returned empty HTTP {} for JSON-RPC request expecting a response",
+                status.as_u16()
+            ),
+        });
     }
 
     let content_type = resp
@@ -352,56 +406,89 @@ async fn forward_once<W: AsyncWrite + Unpin>(
 
     if content_type.contains("text/event-stream") {
         let mut event_stream = resp.bytes_stream().eventsource();
+        let mut wrote_reply = false;
+        let mut stream_err: Option<String> = None;
+
         while let Some(event_res) = event_stream.next().await {
-            let Ok(ev) = event_res else {
-                break;
+            let ev = match event_res {
+                Ok(event) => event,
+                Err(err) => {
+                    stream_err = Some(err.to_string());
+                    break;
+                }
             };
+            if ev.event.eq_ignore_ascii_case("ping") {
+                continue;
+            }
             let data = ev.data.trim();
             if data.is_empty() || data == "[DONE]" {
                 continue;
             }
             if let Ok(parsed_json) = serde_json::from_str::<Value>(data) {
-                if req_kind == RequestKind::Initialize {
-                    update_negotiated_protocol(state, &parsed_json);
-                }
-                if reply_mode == ReplyMode::ExpectReply {
-                    if let Some(out) = stdout_opt.as_deref_mut() {
-                        write_json_line(out, &parsed_json).await?;
+                if parsed_json.is_object() || parsed_json.is_array() {
+                    if req_kind == RequestKind::Initialize {
+                        update_negotiated_protocol(state, &parsed_json);
                     }
-                }
-            } else if reply_mode == ReplyMode::ExpectReply {
-                let compact_parts: Vec<&str> = data.lines().map(str::trim).collect();
-                let single_line = compact_parts.join(" ");
-                if !single_line.is_empty() {
-                    if let Some(out) = stdout_opt.as_deref_mut() {
-                        out.write_all(single_line.as_bytes()).await?;
-                        out.write_all(b"\n").await?;
-                        out.flush().await?;
+                    if reply_mode == ReplyMode::ExpectReply {
+                        if let Some(out) = stdout_opt.as_deref_mut() {
+                            write_json_line(out, &parsed_json).await?;
+                        }
+                        wrote_reply = true;
                     }
                 }
             }
         }
+
+        if reply_mode == ReplyMode::ExpectReply && !wrote_reply {
+            let reason = stream_err.unwrap_or_else(|| {
+                "MCP SSE stream closed without emitting a valid JSON-RPC response".to_string()
+            });
+            return Ok(UpstreamOutcome::TransportError(reason));
+        }
         return Ok(UpstreamOutcome::Success);
     }
 
-    let text = resp.text().await.unwrap_or_default();
+    let text = match resp.text().await {
+        Ok(body) => body,
+        Err(err) => {
+            return Ok(UpstreamOutcome::TransportError(format!(
+                "Failed reading MCP response body: {err}"
+            )));
+        }
+    };
     let trimmed = text.trim();
     if trimmed.is_empty() {
-        return Ok(UpstreamOutcome::Success);
+        if reply_mode == ReplyMode::Notification {
+            return Ok(UpstreamOutcome::Success);
+        }
+        return Ok(UpstreamOutcome::TransportError(
+            "Upstream returned empty HTTP 200 body for JSON-RPC request".to_string(),
+        ));
     }
 
-    if let Ok(parsed_json) = serde_json::from_str::<Value>(trimmed) {
-        if req_kind == RequestKind::Initialize {
-            update_negotiated_protocol(state, &parsed_json);
-        }
-        if reply_mode == ReplyMode::ExpectReply {
-            if let Some(out) = stdout_opt {
-                write_json_line(out, &parsed_json).await?;
+    match serde_json::from_str::<Value>(trimmed) {
+        Ok(parsed_json) if parsed_json.is_object() || parsed_json.is_array() => {
+            if req_kind == RequestKind::Initialize {
+                update_negotiated_protocol(state, &parsed_json);
             }
+            if reply_mode == ReplyMode::ExpectReply {
+                if let Some(out) = stdout_opt {
+                    write_json_line(out, &parsed_json).await?;
+                }
+            }
+            Ok(UpstreamOutcome::Success)
+        }
+        _ => {
+            if reply_mode == ReplyMode::Notification {
+                return Ok(UpstreamOutcome::Success);
+            }
+            let preview: String = trimmed.chars().take(240).collect();
+            Ok(UpstreamOutcome::HttpError {
+                status: status.as_u16(),
+                body: format!("Non-JSON-RPC payload returned on HTTP 200: {preview}"),
+            })
         }
     }
-
-    Ok(UpstreamOutcome::Success)
 }
 
 fn update_negotiated_protocol(state: &mut ProxyState, msg: &Value) {
